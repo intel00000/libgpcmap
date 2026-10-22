@@ -151,7 +151,7 @@ static int describe(int dev, gpcmap_t *out)
     cudaDeviceProp prop;
     memset(out, 0, sizeof(*out));
     for (int t = 0; t < GPCMAP_MAX_TPCS; ++t)
-        out->gpc_of_tpc[t] = -1;
+        out->gpc_of_tpc[t] = out->virtual_gpc_of_tpc[t] = -1;
     CK(cudaGetDeviceProperties(&prop, dev));
     out->cuda_device = dev;
     snprintf(out->name, sizeof(out->name), "%.95s", prop.name);
@@ -342,6 +342,9 @@ static int method_cluster(int dev, gpcmap_t *out)
     for (int t = 0; t < out->num_tpcs; ++t)
         uf.unite(2 * t, 2 * t + 1); // the two SMs of a TPC
     groups_to_map(uf, out);
+    for (int t = 0; t < out->num_tpcs; ++t)
+        out->virtual_gpc_of_tpc[t] = out->gpc_of_tpc[t];
+    out->num_virtual_gpcs = out->num_gpcs;
     snprintf(out->method, sizeof(out->method), "cluster");
     return 0;
 }
@@ -365,6 +368,7 @@ int gpcmap_cluster_fits(int dev, const int *tpcs, int n, int timeout_ms)
     if (e != cudaSuccess)
         return -(int)e;
     CK(cudaEventRecord(done, s));
+    // Poll until the cluster has run or timeout_ms has passed.
     struct timespec t0, now;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;)
@@ -1001,6 +1005,28 @@ int gpcmap_query(int dev, const char *method, gpcmap_t *out)
     return EINVAL;
 }
 
+const char *gpcmap_groups(const gpcmap_t *m)
+{
+    return !strcmp(m->method, "corun") ? "shared_path" : !strcmp(m->method, "cluster") ? "virtual_gpc"
+                                                                                       : "gpc";
+}
+
+static void write_groups(FILE *f, const int *group_of_tpc, int num_groups, int num_tpcs)
+{
+    for (int g = 0; g < num_groups; ++g)
+    {
+        fprintf(f, "%s\n  \"%d\": [", g ? "," : "", g);
+        bool first = true;
+        for (int t = 0; t < num_tpcs; ++t)
+            if (group_of_tpc[t] == g)
+            {
+                fprintf(f, "%s%d", first ? "" : ", ", t);
+                first = false;
+            }
+        fprintf(f, "]");
+    }
+}
+
 int gpcmap_write_json(const gpcmap_t *m, const char *path)
 {
     FILE *f = fopen(path, "w");
@@ -1009,19 +1035,13 @@ int gpcmap_write_json(const gpcmap_t *m, const char *path)
     fprintf(f, "{\n \"device\": \"%s\",\n \"uuid\": \"%s\",\n \"cuda_device\": %d,\n \"sms\": %d,\n \"tpcs\": %d,\n"
                " \"method\": \"%s\",\n \"groups\": \"%s\",\n \"cluster_capacity\": %d,\n \"corun_conflicts\": %d,\n"
                " \"gpc_to_tpcs\": {",
-            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method,
-            strcmp(m->method, "corun") ? "gpc" : "shared_path", m->cluster_capacity, m->corun_conflicts);
-    for (int g = 0; g < m->num_gpcs; ++g)
+            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method, gpcmap_groups(m),
+            m->cluster_capacity, m->corun_conflicts);
+    write_groups(f, m->gpc_of_tpc, m->num_gpcs, m->num_tpcs);
+    if (m->num_virtual_gpcs)
     {
-        fprintf(f, "%s\n  \"%d\": [", g ? "," : "", g);
-        bool first = true;
-        for (int t = 0; t < m->num_tpcs; ++t)
-            if (m->gpc_of_tpc[t] == g)
-            {
-                fprintf(f, "%s%d", first ? "" : ", ", t);
-                first = false;
-            }
-        fprintf(f, "]");
+        fprintf(f, "\n },\n \"virtual_gpc_to_tpcs\": {");
+        write_groups(f, m->virtual_gpc_of_tpc, m->num_virtual_gpcs, m->num_tpcs);
     }
     fprintf(f, "\n },\n \"unplaced\": [");
     bool first = true;

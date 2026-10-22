@@ -1,41 +1,53 @@
-# libgpcmap
+# libgpcmap - Mapping TPCs to GPCs
 
-Which TPC ids share a GPC on this device. A small library and command beside
-the libsmctrl fork: libsmctrl confines a stream to a set of TPCs, libgpcmap
-says which of them sit together.
+Test which TPC ids share a GPC on this device.
 
-Why it exists: a mask bit is one TPC (two SMs), the global TPC id is the
-driver's numbering of the enabled TPCs, and which ids share a GPC differs
-per product and per chip (round robin over the enabled GPCs with a
-product-specific tail on every part measured so far). Mask layouts that keep
-a GPC free, or free SMs inside one GPC for a clustered decode kernel, need
-the map; it has to be read from the device.
+Why it exists: each mask bit represents one TPC (two SMs), and global TPC
+ids follow the driver's numbering of enabled TPCs. The TPCs that share a GPC
+vary by product and chip, so layouts that reserve a GPC—or SMs within one
+GPC for a clustered decode kernel—must read this map from the device.
 
 ## Methods
 
-- `rm`: the driver's own table through two non-privileged RM controls
-  (`NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER`, `..._GET_SM_TO_GPC_TPC_MAPPINGS`).
-  Exact, refused on MIG slices, and ABI-bound: build with
-  `make RM=1 NV=/path/to/open-gpu-kernel-modules` of the installed driver.
-- `nvdebug`: the same table from the hardware, when `nvdebug` kernel module
-  is loaded: `/proc/gpuN/CWD_GPC_TPC_ID*` are the work distributor's registers
-  the driver programs with its striping of logical
-  TPC ids over the GPCs, one byte per TPC with the GPC in the upper nibble.
-  Loading the module needs root, reading the files does not; the table reads as
-  zero while the GPU is off.
-- `cluster`: thread-block clusters (Hopper and later). The 8 CTAs of one
-  cluster are resident in one GPC, so the SMs they land on share a GPC;
-  clusters are launched with one TPC excluded at a time and the SMs unioned.
-  The device holds only so many clusters at once (15 on an H200 of 132 SMs,
-  19 on an RTX 5090 of 170), so the clusters seen refine the table rather
-  than partition every SM: TPCs left unplaced are settled afterwards, one
-  cluster on the TPC plus three TPCs of a candidate GPC, which runs only when
-  they share the GPC. A cluster that finds no room pends for good, so the
-  command runs each of those tries in a child process with a timeout. A try
-  can also pend inside the table's GPC (seen on an H200 for the tail TPCs of
-  a GPC: cluster placement is constrained below the GPC), so TPCs may stay
-  unplaced; the command then exits 2 and the driver's table is the complete
-  answer.
+- `rm`: reads the driver's own table through two non-privileged RM controls
+  (`NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER` and
+  `..._GET_SM_TO_GPC_TPC_MAPPINGS`). It is exact but unavailable on MIG
+  slices, and its ABI is tied to the installed driver; build it with
+  `make RM=1 NV=/path/to/open-gpu-kernel-modules` from that driver.
+
+  The table identifies both the physical GPC for each TPC (its memory path)
+  and the virtual GPC where the work distributor places clusters. Both are
+  reported, with the virtual grouping in `virtual_gpc_to_tpcs`.
+
+- `nvdebug`: reads the same table from the hardware when the `nvdebug` kernel
+  module is loaded. The files `/proc/gpuN/CWD_GPC_TPC_ID*` expose the work
+  distributor's registers, which map logical TPC ids to GPCs using one byte per
+  TPC; the GPC id is in the upper nibble. **Requires root, untested**.
+
+- `cluster`: uses thread-block clusters (Hopper and later). The hardware
+  places all 8 CTAs of a cluster inside one virtual GPC, so SMs that host
+  the same cluster share a GPC.
+
+  - Probing: a kernel is launched as clusters of 8 CTAs, each CTA sized to
+    fill one SM, so a cluster occupies 8 SMs (4 TPCs) of one GPC. Every CTA
+    records its SM id, and the SMs of each cluster are unioned.
+
+  - Coverage: the device holds only a limited number of clusters at once,
+    so one launch does not reach every SM.
+    The launch is repeated, and then repeated with one TPC excluded at
+    a time through the stream mask, which moves the clusters around until
+    every TPC has shared a cluster with its GPC-mates.
+
+  - Settling: a TPC still unplaced is tried against each GPC found: one
+    cluster on that TPC plus three TPCs of the GPC runs only if the four
+    share a GPC. A cluster that finds no room does not fail, it pends
+    forever and times out eventually.
+
+  - Limits: a TPC that forms a virtual GPC of its own (the tail TPCs on
+    Hopper) can never share a cluster with anything, so it stays unplaced;
+    the command then exits 2, and the driver's table is the complete answer.
+    The groups are reported as `virtual_gpc`.
+
 - `corun`: the groups of TPCs that share a path to memory, by timing, in
   two stages.
 
@@ -54,34 +66,22 @@ the map; it has to be read from the device.
     Merges are selected by strength, subject to the ten-TPC limit, and repeated
     until no more merges are possible.
 
-  What the groups are depends on the part: on an RTX 5090 the path is the
-  GPC's (one streaming TPC slows its whole GPC by 14%, two halves of a GPC
-  stream together at 1.4 to 2.0 times their additive time) and the groups are
-  the eleven GPCs; on an A100 the path belongs to a sub-group of three or four
-  TPCs (pairs couple at 1.52, the sub-group at 1.14, the two halves of a GPC
-  not at all, and a same-GPC triple and quad stream together no slower than
-  foreign ones), so the groups are the sub-groups and the GPC does not show.
-  The command therefore reports a co-run map as shared-path groups, in doubt
-  as a GPC map, and exits 2 (a join refused for exceeding the limit is
-  reported as well); the JSON says `"groups": "shared_path"`. On Ampere the
-  GPC comes from the driver's table or not at all.
-
 ## Methods comparison
 
 | | `rm` | `nvdebug` | `cluster` | `corun` |
 | --- | --- | --- | --- | --- |
-| source | the driver's SM order table, two RM controls | the same table in hardware, the work distributor's `CWD_GPC_TPC_ID` registers through the nvdebug module | where clusters of 8 CTAs land: co-resident in one GPC | timing: streams that share a path to memory slow each other |
+| source | the driver's SM order table, two RM controls: the physical and the virtual GPC of every TPC | the same table in hardware, the work distributor's `CWD_GPC_TPC_ID` registers through the nvdebug module | where clusters of 8 CTAs land: co-resident in one GPC | timing: streams that share a path to memory slow each other |
 | nature | read, exact | read, exact | measured placement, exact where it covers | measured contention, inferred |
 | needs | the open-kernel-module SDK headers at build time (`RM=1`); no privilege | the module loaded as root; reading is unprivileged; a context active | Hopper or later; libsmctrl stream masks | libsmctrl stream masks; a quiet GPU |
 | refused or absent | on MIG slices | where the module cannot be loaded | Ampere and older | never; finds nothing on Hopper |
-| answer | the GPC of every TPC | the GPC of every TPC | the GPC of every TPC the clusters reach; the rest settled one by one, or left unplaced | the groups of TPCs that share a path: the GPCs on GB202, sub-groups of three or four inside a GPC on GA100 |
+| answer | the physical and the virtual GPC of every TPC | the GPC of every TPC | the virtual GPC of every TPC the clusters reach; the rest settled one by one; single-TPC virtual GPCs stay unplaced | the groups of TPCs that share a path: the GPCs on GB202, sub-groups of three or four inside a GPC on GA100 |
 | cost | milliseconds | milliseconds | 0.6 s on an RTX 5090, 109 s on an H200 | about 4 min on an RTX 5090, 2.5 min on an A100 |
-| exit, `groups` | 0, `gpc` | 0, `gpc` | 0, `gpc`; 2 with TPCs left unplaced | 2, `shared_path`; a refused join is counted |
+| exit, `groups` | 0, `gpc` | 0, `gpc` | 0, `virtual_gpc`; 2 with TPCs left unplaced | 2, `shared_path`; a refused join is counted |
 | hazards | ABI tied to the installed driver | PCI-order numbering; zero while the GPU is off | a cluster that finds no room pends for good, hence child processes | drift, size-dependent floors, one-way partner spikes, all handled; still inference |
 
-`rm` and `nvdebug` are the ground truth where available and identical in
-content; `cluster` recovers the same map, less the tail TPCs its clusters
-never reach, without privileges or headers on Hopper and later;
+`rm` is the ground truth where it builds, `nvdebug` the same table where
+the module is loaded; `cluster` recovers the virtual GPCs, less the
+single-TPC ones, without privileges or headers on Hopper and later;
 
 `corun` is what remains on an Ampere MIG slice and finds the sub-group
 structure there. `auto` tries them in order and takes the first
@@ -104,27 +104,38 @@ kernel lands on SMs 2t and 2t+1, both and no other.
     make
     ./gpcmap --smctrl /path/to/libsmctrl.so --json gpc_map.json
 
-prints the GPCs with their TPC ids and writes the JSON (`gpc_to_tpcs`) that
-the geometry suite and slackserve's mask layouts read. `--method` picks one
+prints the GPCs with their TPC ids and writes the JSON that the geometry
+suite and slackserve's mask layouts read: `gpc_to_tpcs` with `groups` saying
+what its groups are (`gpc`, `virtual_gpc`, `shared_path`), and
+`virtual_gpc_to_tpcs` when the method knows the virtual grouping. `--method` picks one
 method, `--no-complement` skips the per-TPC settlement, `--no-validate` the
 check; `GPCMAP_DUMP=<prefix>` writes the co-run matrices as CSV. Exit 0 is
 a checked GPC map, 2 a map in doubt (every co-run map, a refused join, or TPCs left unplaced), 1 no answer. The C API (`gpcmap_init`, `gpcmap_query`,
-`gpcmap_cluster_fits`, `gpcmap_validate`, `gpcmap_write_json`).
+`gpcmap_cluster_fits`, `gpcmap_validate`, `gpcmap_groups`, `gpcmap_write_json`).
 
 ## Measured so far
 
-| part | SMs | GPCs enabled (TPCs each) | ids |
+| GPU | SMs | GPC layout | TPC numbering |
 | --- | --- | --- | --- |
-| A100 SXM4 80GB | 108 | 7: 7, 7, 8, 8, 8, 8, 8 | round robin, the 7-TPC GPCs last; a second A100 identical; `corun` gives the two halves of every GPC |
-| H100 SXM 80GB | 132 | 8: 9, 8, 8, 8, 8, 8, 8, 9 | round robin for ids 0-31, seven GPCs for 32-59, leftovers 60-65 |
-| H200 SXM 141GB, three chips | 132 | 8: 6, 8, 8, 8, 9, 9, 9, 9 / 7, 8, 8, 8, 8, 9, 9, 9 / 8, 8, 8, 8, 8, 8, 9, 9 | as the H100 for ids 0-59; 60-65 differ per chip, so the map is per device |
-| RTX 5090 | 170 | 11 of 12: three of 7, eight of 8 | round robin for ids 0-76, 77-84 to the full GPCs |
+| A100 SXM4 80GB | 108 | 7 physical GPCs: 2×7 TPCs and 5×8 TPCs; no virtual grouping | Round-robin numbering, with the 7-TPC GPCs last. A second A100 matched. `corun` finds two groups per GPC. |
+| H100 SXM 80GB | 132 | 8 physical GPCs: 2×9 TPCs and 6×8 TPCs; virtual layout matches the H200 | TPCs 0–31 use 8 GPCs, 32–59 use 7 GPCs, and 60–65 are leftovers. |
+| H200 SXM 141GB | 132 | 8 physical GPCs with 6–9 TPCs each; 8 virtual GPCs with 4, 8, 8, 8, 8, 8, 9, and 9 TPCs, plus singleton virtual GPCs for TPCs 62–65 | TPCs 0–31 are round-robin across 8 virtual GPCs; 32–59 across virtual GPCs 1–7. TPCs 60–61 are the ninth TPCs in GPCs 6–7; 62–65 are singletons. |
+| RTX 5090 | 170 | 11 GPCs: 3×7 TPCs and 8×8 TPCs; physical and virtual groups match | Round-robin for TPCs 0–76; TPCs 77–84 fill the full GPCs. |
 
-On one H200 the cluster method left the four tail TPCs of a GPC unplaced:
-a cluster of 8 pends on them with three TPCs of their own GPC, so cluster
-placement is constrained below the GPC and the table is the complete
-answer there. The co-run finds nothing on Hopper: two TPCs of one GPC
-stream as fast together as apart, the GPC's path binds only from four.
+Physical and virtual GPCs. The driver groups TPCs by physical and virtual
+GPC. TPCs in a physical GPC share a memory path, so this grouping determines
+bandwidth isolation. The work distributor also places clusters within virtual
+GPCs. On Hopper, a virtual GPC is usually a physical GPC without a few tail
+TPCs; each tail TPC forms its own virtual GPC.
+
+An H200 probe confirmed that an eight-CTA cluster runs only when its four
+TPCs are in the same virtual GPC. All 126 tested four-TPC combinations in a
+nine-TPC GPC worked; none spanning two GPCs or including a tail TPC did.
+Therefore, cluster-shaped kernels need eight free SMs in one virtual GPC;
+free SMs on a tail TPC do not count.
+
+The co-run finds nothing on Hopper: two TPCs of one GPC stream as fast
+together as apart, and the GPC's path only saturates from four TPCs on.
 
 ## Sources
 

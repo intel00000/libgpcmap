@@ -180,13 +180,16 @@ int gpcmap_rm_query(const char *uuid, gpcmap_t *out)
         rc = ERANGE;
         goto done;
     }
-    /* per SM; both SMs of a TPC must agree */
-    int gpc_ids[GPCMAP_MAX_GPCS * 4];
-    int n_ids = 0;
+    /* per SM; both SMs of a TPC must agree. The physical GPC is the memory
+     * path, the virtual GPC is where clusters are placed; on GA100 the
+     * virtual column is one value for the whole chip, i.e. no grouping. */
+    int gpc_ids[GPCMAP_MAX_GPCS * 4], vgpc_ids[GPCMAP_MAX_TPCS];
+    int n_ids = 0, n_vids = 0;
     for (unsigned i = 0; i < order.numSm; ++i)
     {
         int t = (int)order.globalSmId[i].globalTpcId;
         int g = (int)order.globalSmId[i].gpcId;
+        int v = (int)order.globalSmId[i].virtualGpcId;
         if (t != (int)(i / 2) || t >= GPCMAP_MAX_TPCS)
         {
             rc = ERANGE;
@@ -211,8 +214,26 @@ int gpcmap_rm_query(const char *uuid, gpcmap_t *out)
             goto done;
         }
         out->gpc_of_tpc[t] = k;
+        for (k = 0; k < n_vids && vgpc_ids[k] != v; ++k)
+        {
+        }
+        if (k == n_vids)
+            vgpc_ids[n_vids++] = v;
+        if (out->virtual_gpc_of_tpc[t] >= 0 && out->virtual_gpc_of_tpc[t] != k)
+        {
+            rc = ERANGE;
+            goto done;
+        }
+        out->virtual_gpc_of_tpc[t] = k;
     }
     out->num_gpcs = n_ids;
+    out->num_virtual_gpcs = n_vids;
+    if (n_vids == 1 && n_ids > 1)
+    {
+        out->num_virtual_gpcs = 0;
+        for (int t = 0; t < out->num_tpcs; ++t)
+            out->virtual_gpc_of_tpc[t] = -1;
+    }
     snprintf(out->method, sizeof(out->method), "rm");
     rc = 0;
 done:

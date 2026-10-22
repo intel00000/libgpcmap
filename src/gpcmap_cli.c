@@ -5,13 +5,16 @@
  *
  * After the cluster method, each TPC the clusters left unplaced is tried
  * against the GPCs found, one child process per try: a cluster of 8 CTAs on
- * the TPC plus three TPCs of a GPC runs only when they share the GPC, and a
- * try that finds no room pends for good, so it runs in a child that is
- * killed on timeout. Candidates are ordered by the id stride of each GPC. */
+ * the TPC plus three TPCs of a GPC runs only when they share a GPC. A try
+ * that finds no room pends for good (no error, no driver timeout, no way to
+ * cancel it), so it runs in a child that reports "pending" once --timeout-ms
+ * has passed and is killed if it does not exit. Candidates are ordered by
+ * the id stride of each GPC. */
 #include "gpcmap.h"
 
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +34,12 @@ static int usage(void)
 
 static int child_fits(int s, const int *g, int n_g, int timeout_ms)
 {
-    /* 1 fits, 0 pends, -1 error */
+    /* Run one --fits trial in a child process. Exit 0 means the cluster ran;
+     * exit 3 means it was still pending after timeout_ms. Other exit codes
+     * indicate an error. The child exits after the timeout, taking any stuck
+     * launch with it, and is killed if it remains for another 15 seconds.
+     * A pending trial means no room, not an error. Return 1 for fits, 0 for
+     * pending, and -1 for errors. */
     pid_t pid = fork();
     if (pid < 0)
         return -1;
@@ -140,23 +148,45 @@ static void complement(gpcmap_t *m, int timeout_ms)
     }
 }
 
-static void print_map(const gpcmap_t *m, FILE *f)
+static void print_groups(const int *group_of_tpc, int num_groups, int num_tpcs, const char *name, FILE *f)
 {
-    fprintf(f, "%s (cuda %d, uuid %s): %d SMs, %d TPCs, %d GPCs by %s%s\n", m->name, m->cuda_device, m->uuid,
-            m->num_sms, m->num_tpcs, m->num_gpcs, m->method, m->cluster_capacity ? "" : "");
-    if (m->cluster_capacity)
-        fprintf(f, "clusters of 8 CTAs held at once: %d\n", m->cluster_capacity);
-    for (int g = 0; g < m->num_gpcs; ++g)
+    for (int g = 0; g < num_groups; ++g)
     {
         int n = 0;
-        fprintf(f, "  GPC %2d:", g);
-        for (int t = 0; t < m->num_tpcs; ++t)
-            if (m->gpc_of_tpc[t] == g)
+        fprintf(f, "  %s %2d:", name, g);
+        for (int t = 0; t < num_tpcs; ++t)
+            if (group_of_tpc[t] == g)
             {
                 fprintf(f, " %d", t);
                 n++;
             }
         fprintf(f, "   (%d TPCs)\n", n);
+    }
+}
+
+static void print_map(const gpcmap_t *m, FILE *f)
+{
+    const char *groups = gpcmap_groups(m);
+    const char *what = !strcmp(groups, "gpc") ? "GPCs" : !strcmp(groups, "virtual_gpc") ? "virtual GPCs"
+                                                                                        : "shared-path groups";
+    fprintf(f, "%s (cuda %d, uuid %s): %d SMs, %d TPCs, %d %s by %s\n", m->name, m->cuda_device, m->uuid, m->num_sms,
+            m->num_tpcs, m->num_gpcs, what, m->method);
+    if (m->cluster_capacity)
+        fprintf(f, "clusters of 8 CTAs held at once: %d\n", m->cluster_capacity);
+    print_groups(m->gpc_of_tpc, m->num_gpcs, m->num_tpcs, !strcmp(groups, "shared_path") ? "group" : "GPC", f);
+    if (m->num_virtual_gpcs && !strcmp(groups, "gpc"))
+    {
+        bool same = true;
+        for (int a = 0; a < m->num_tpcs && same; ++a)
+            for (int b = a + 1; b < m->num_tpcs && same; ++b)
+                same = (m->gpc_of_tpc[a] == m->gpc_of_tpc[b]) == (m->virtual_gpc_of_tpc[a] == m->virtual_gpc_of_tpc[b]);
+        if (same)
+            fprintf(f, "virtual GPCs (cluster placement): the same groups\n");
+        else
+        {
+            fprintf(f, "virtual GPCs (cluster placement):\n");
+            print_groups(m->virtual_gpc_of_tpc, m->num_virtual_gpcs, m->num_tpcs, "virtual GPC", f);
+        }
     }
     int unplaced = 0;
     for (int t = 0; t < m->num_tpcs; ++t)

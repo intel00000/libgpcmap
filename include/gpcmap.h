@@ -34,10 +34,12 @@ extern "C"
         int num_sms;
         int num_tpcs;
         int num_gpcs;
-        int gpc_of_tpc[GPCMAP_MAX_TPCS]; /* -1: unplaced */
-        char method[16];                 /* rm | cluster | corun */
-        int cluster_capacity;            /* clusters of 8 CTAs the device holds at once (cluster method) */
-        int corun_conflicts;             /* co-run merges refused for exceeding a GPC; the command exits 2 */
+        int gpc_of_tpc[GPCMAP_MAX_TPCS];         /* -1: unplaced */
+        int num_virtual_gpcs;                    /* 0: the method does not know the virtual grouping */
+        int virtual_gpc_of_tpc[GPCMAP_MAX_TPCS]; /* the virtual GPC: where clusters are placed; -1: unknown */
+        char method[16];                         /* rm | cluster | corun */
+        int cluster_capacity;                    /* clusters of 8 CTAs the device holds at once (cluster method) */
+        int corun_conflicts;                     /* co-run merges refused for exceeding a GPC; the command exits 2 */
     } gpcmap_t;
 
     /* Load libsmctrl (NULL: the preloaded one). 0, or ENOENT / ENOSYS. */
@@ -52,9 +54,12 @@ extern "C"
      * EAGAIN (no clear answer), EIO. */
     int gpcmap_query(int cuda_device, const char *method, gpcmap_t *out);
 
-    /* Does one cluster of 8 CTAs run with only these TPCs enabled? 1 ran,
-     * 0 pending after timeout_ms (and pending for good: call it in a child
-     * process), <0 a CUDA error. */
+    /* Launch one cluster of 8 CTAs with only these TPCs enabled and poll it
+     * for timeout_ms. 1: it ran, so the TPCs share a virtual GPC. 0: still
+     * pending. A cluster with no room is never scheduled and never fails:
+     * CUDA does not time it out and the launch cannot be cancelled, so the
+     * calling context keeps it for good; call this from a process you can
+     * discard. <0: a CUDA error. */
     int gpcmap_cluster_fits(int cuda_device, const int *tpcs, int n, int timeout_ms);
 
     /* For every t, a kernel on TPC t alone lands on SMs 2t and 2t+1, both and
@@ -66,6 +71,10 @@ extern "C"
 
     /* The map as JSON in the gpc_to_tpcs form. */
     int gpcmap_write_json(const gpcmap_t *map, const char *path);
+
+    /* What gpc_to_tpcs holds: "gpc" (physical GPCs, the memory path), "virtual_gpc"
+     * (the cluster method: where clusters are placed) or "shared_path" (co-run). */
+    const char *gpcmap_groups(const gpcmap_t *map);
 
     /* gpcmap_rm.c; ENOSYS unless built with RM=1. */
     int gpcmap_rm_query(const char *uuid, gpcmap_t *out);
