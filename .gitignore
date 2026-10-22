@@ -9,3 +9,4 @@
 libgpcmap.so
 gpcmap
 *.o
+rmflags

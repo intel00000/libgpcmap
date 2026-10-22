@@ -26,19 +26,27 @@ the map; it has to be read from the device.
   cluster on the TPC plus three TPCs of a candidate GPC, which runs only when
   they share the GPC. A cluster that finds no room pends for good, so the
   command runs each of those tries in a child process with a timeout.
-- `corun`: streaming kernels contend for the GPC's path to memory, so a
-  victim slows more beside an aggressor in its own GPC. The method is
-  agglomerative: clusters start as single TPCs; each round every cluster
-  streams as the aggressor against every other cluster as the victim, a row's
-  slowdowns split into a slow mode (gap of 3% or more) and the rest, mutually
-  slow clusters merge (a row with no split defers to a bigger aggressor's
-  row), and the merged clusters press harder in the next round; a merge
-  beyond ten TPCs ends the method with no answer. Timing only, so the
-  fallback where clusters do not exist (Ampere) or the table is refused (MIG
-  slices). On the RTX 5090 one streaming TPC already slows its whole GPC
-  (12 to 13%) and the first round yields the map; on an A100 one TPC couples
-  to one partner only and the pairs find the rest of their GPC in later
-  rounds.
+- `corun`: because streaming kernels share a GPC's path to memory, this
+  method proceeds in two stages.
+  
+  - First, each TPC streams against every other TPC. The victim's runtime
+    with an aggressor is compared with its solo runtime. In each row, a
+    plateau of nearly equal slowdowns identifies the closest peers, and
+    mutually slowing TPCs are merged.
+
+  - Next, pairs of clusters stream together, and their runtime is compared with
+    the sum of their separate rates.
+    Clusters in the same GPC share a path and therefore run slower together;
+    unrelated pairs show only the device-wide effect, measured using foreign
+    stand-ins of the partner's size.
+    A join requires at least 10% overhead over the additive time and 5% overhead
+    over the stand-ins in both directions.
+
+    Merges are selected by strength, subject to the ten-TPC limit, and repeated
+    until no more merges are possible. If a join exceed a GPC's capacity, the map
+    is considered uncertain; the command reports this and exits 2. This is a
+    timing-only method and serves as the fallback when clusters are unavailable
+    (Ampere) or the driver table is refused (MIG slices).
 
 Every answer is followed by the single-TPC check: with TPC t alone enabled a
 kernel lands on SMs 2t and 2t+1, both and no other.
@@ -56,7 +64,8 @@ kernel lands on SMs 2t and 2t+1, both and no other.
 prints the GPCs with their TPC ids and writes the JSON (`gpc_to_tpcs`) that
 the geometry suite and slackserve's mask layouts read. `--method` picks one
 method, `--no-complement` skips the per-TPC settlement, `--no-validate` the
-check. The C API (`gpcmap_init`, `gpcmap_query`,
+check; `GPCMAP_DUMP=<prefix>` writes the co-run matrices as CSV. Exit 0 is
+a checked answer, 2 an answer in doubt, 1 no answer. The C API (`gpcmap_init`, `gpcmap_query`,
 `gpcmap_cluster_fits`, `gpcmap_validate`, `gpcmap_write_json`).
 
 ## Measured so far

@@ -125,8 +125,10 @@ __global__ void k_stream_read(const float4 *__restrict__ p, size_t n4, float *si
 static int describe(int dev, gpcmap_t *out)
 {
     cudaDeviceProp prop;
-    CK(cudaGetDeviceProperties(&prop, dev));
     memset(out, 0, sizeof(*out));
+    for (int t = 0; t < GPCMAP_MAX_TPCS; ++t)
+        out->gpc_of_tpc[t] = -1;
+    CK(cudaGetDeviceProperties(&prop, dev));
     out->cuda_device = dev;
     snprintf(out->name, sizeof(out->name), "%.95s", prop.name);
     const unsigned char *u = (const unsigned char *)prop.uuid.bytes;
@@ -135,8 +137,6 @@ static int describe(int dev, gpcmap_t *out)
              u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
     out->num_sms = prop.multiProcessorCount;
     out->num_tpcs = prop.multiProcessorCount / 2;
-    for (int t = 0; t < GPCMAP_MAX_TPCS; ++t)
-        out->gpc_of_tpc[t] = -1;
     return 0;
 }
 
@@ -362,11 +362,12 @@ int gpcmap_cluster_fits(int dev, const int *tpcs, int n, int timeout_ms)
 // tldr: TPCs that share a GPC slow each other down when they stream together;
 // TPCs in different GPCs have less of an impact on each other.
 //
-// Agglomerative: clusters start as single TPCs; each round every cluster
-// streams against every other, the victim's time beside the aggressor over
-// its time alone, measured back to back so that clock drift cancels; a row's
-// GPC-mates are its plateau of near-equal slowdowns; mutually slow clusters
-// merge and press harder in the next round.
+// Two stages. The atoms: every TPC streams against every other, the victim's
+// time beside the aggressor over its time alone (back to back, so clock drift
+// cancels); a row's plateau of near-equal slowdowns is its closest kin and
+// mutually slow TPCs merge. The joining: two clusters stream together, and
+// clusters in one GPC share its path to memory and stream slower than their
+// rates add up to.
 static float median_of(std::vector<float> v)
 {
     std::sort(v.begin(), v.end());
@@ -487,7 +488,9 @@ static int method_corun(int dev, gpcmap_t *out)
     std::vector<std::vector<int>> cl(out->num_tpcs);
     for (int t = 0; t < out->num_tpcs; ++t)
         cl[t] = {t};
-    for (int round = 0; round < 8; ++round)
+    // the victim rows once, for the atoms: later rounds with bigger aggressors
+    // measure the device's bandwidth floor, not the GPC
+    for (int round = 0; round < 1; ++round)
     {
         const size_t k = cl.size();
         if (k < 2)
@@ -660,30 +663,36 @@ static int method_corun(int dev, gpcmap_t *out)
                 }
         if (!measured)
             break;
+        // the bar for a pair: the same union with a stand-in of the partner's
+        // size cut from each of the three largest other clusters (foreign in
+        // all but at most one), the median of their caps
+        auto control = [&](size_t a, size_t b) -> float
+        {
+            std::vector<size_t> others;
+            for (size_t o = 0; o < k; ++o)
+                if (o != a && o != b && cl[o].size() >= cl[b].size())
+                    others.push_back(o);
+            std::sort(others.begin(), others.end(), [&](size_t x, size_t y)
+                      { return cl[x].size() > cl[y].size(); });
+            std::vector<float> vals;
+            for (size_t i = 0; i < others.size() && i < 3; ++i)
+            {
+                std::vector<int> stand(cl[others[i]].begin(), cl[others[i]].begin() + cl[b].size());
+                vals.push_back(c.cap(cl[a], stand));
+            }
+            return vals.empty() ? 1.0f : median_of(vals);
+        };
         std::vector<std::vector<float>> excess(k, std::vector<float>(k, 0.0f));
         for (size_t a = 0; a < k; ++a)
-        {
-            std::vector<float> all;
-            for (size_t b = 0; b < k; ++b)
-                if (capv[a][b] > 0)
-                    all.push_back(capv[a][b]);
-            if (all.empty())
-                continue;
-            float row_median = median_of(all);
-            for (size_t b = 0; b < k; ++b)
-            {
-                if (capv[a][b] <= 0)
-                    continue;
-                std::vector<float> same;
-                for (size_t o = 0; o < k; ++o)
-                    if (capv[a][o] > 0 && cl[o].size() == cl[b].size())
-                        same.push_back(capv[a][o]);
-                float base = same.size() >= 3   ? median_of(same)
-                             : same.size() == 2 ? std::min(same[0], same[1])
-                                                : row_median;
-                excess[a][b] = capv[a][b] - base;
-            }
-        }
+            for (size_t b = a + 1; b < k; ++b)
+                if (capv[a][b] >= 1.10f)
+                {
+                    excess[a][b] = capv[a][b] - control(a, b);
+                    excess[b][a] = capv[a][b] - control(b, a);
+                    if (getenv("GPCMAP_DEBUG"))
+                        fprintf(stderr, "  join %d(%zu)+%d(%zu): cap %.3f, over the stand-ins %.3f / %.3f\n", cl[a][0],
+                                cl[a].size(), cl[b][0], cl[b].size(), capv[a][b], excess[a][b], excess[b][a]);
+                }
         struct Link
         {
             float strength;
@@ -692,7 +701,7 @@ static int method_corun(int dev, gpcmap_t *out)
         std::vector<Link> links;
         for (size_t a = 0; a < k; ++a)
             for (size_t b = a + 1; b < k; ++b)
-                if (capv[a][b] >= 1.05f && excess[a][b] >= 0.05f && excess[b][a] >= 0.05f)
+                if (capv[a][b] >= 1.10f && excess[a][b] >= 0.05f && excess[b][a] >= 0.05f)
                     links.push_back({std::min(excess[a][b], excess[b][a]), (int)a, (int)b});
         std::sort(links.begin(), links.end(), [](const Link &x, const Link &y)
                   { return x.strength > y.strength; });
@@ -755,19 +764,6 @@ static int method_corun(int dev, gpcmap_t *out)
     c.release();
     std::sort(cl.begin(), cl.end(), [](const std::vector<int> &x, const std::vector<int> &y)
               { return x[0] < y[0]; });
-    if (out->corun_conflicts)
-    {
-        fprintf(stderr, "gpcmap: corun: %d merges would have exceeded a GPC; the grouping is in doubt:\n",
-                out->corun_conflicts);
-        for (auto &g : cl)
-        {
-            fprintf(stderr, "   ");
-            for (int t : g)
-                fprintf(stderr, " %d", t);
-            fprintf(stderr, "\n");
-        }
-        return EAGAIN;
-    }
     // clusters of two or more TPCs are the GPCs; the rest stay unplaced
     out->num_gpcs = 0;
     for (auto &g : cl)
@@ -843,6 +839,7 @@ int gpcmap_query(int dev, const char *method, gpcmap_t *out)
         rc = gpcmap_rm_query(out->uuid, out);
         if (rc == 0 || !automatic)
             return rc;
+        describe(dev, out);
     }
     if (automatic || !strcmp(method, "cluster"))
     {
@@ -863,7 +860,7 @@ int gpcmap_write_json(const gpcmap_t *m, const char *path)
     FILE *f = fopen(path, "w");
     if (!f)
         return errno;
-    fprintf(f, "{\n \"device\": \"%s\",\n \"uuid\": \"%s\",\n \"cuda_device\": %d,\n \"num_sms\": %d,\n \"num_tpcs\": %d,\n"
+    fprintf(f, "{\n \"device\": \"%s\",\n \"uuid\": \"%s\",\n \"cuda_device\": %d,\n \"sms\": %d,\n \"tpcs\": %d,\n"
                " \"method\": \"%s\",\n \"cluster_capacity\": %d,\n \"corun_conflicts\": %d,\n \"gpc_to_tpcs\": {",
             m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method, m->cluster_capacity,
             m->corun_conflicts);

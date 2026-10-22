@@ -225,6 +225,12 @@ int main(int argc, char **argv)
     if (do_complement && !strcmp(map.method, "cluster"))
         complement(&map, timeout_ms);
     print_map(&map, stdout);
+    if (map.corun_conflicts)
+    {
+        fprintf(stderr, "gpcmap: %d co-run merges refused for exceeding a GPC: the grouping is in doubt\n",
+                map.corun_conflicts);
+        rc = 2;
+    }
     if (validate)
     {
         int failed[16];

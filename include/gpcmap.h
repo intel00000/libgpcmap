@@ -34,7 +34,7 @@ extern "C"
         int gpc_of_tpc[GPCMAP_MAX_TPCS]; /* -1: unplaced */
         char method[16];                 /* rm | cluster | corun */
         int cluster_capacity;            /* clusters of 8 CTAs the device holds at once (cluster method) */
-        int corun_conflicts;             /* co-run merges refused for exceeding a GPC (0 means a clean answer) */
+        int corun_conflicts;             /* co-run merges refused for exceeding a GPC; the command exits 2 */
     } gpcmap_t;
 
     /* Load libsmctrl (NULL: the preloaded one). 0, or ENOENT / ENOSYS. */

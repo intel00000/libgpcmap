@@ -5,7 +5,8 @@
 CUDA ?= /usr/local/cuda
 NVCC ?= $(CUDA)/bin/nvcc
 ARCHS ?= -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 \
-         -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120
+         -gencode arch=compute_100,code=sm_100 -gencode arch=compute_120,code=sm_120 \
+         -gencode arch=compute_120,code=compute_120
 CFLAGS ?= -O2 -Wall
 RM ?= 0
 NV ?= /usr/src/open-gpu-kernel-modules
@@ -16,13 +17,16 @@ endif
 
 all: libgpcmap.so gpcmap
 
-libgpcmap.so: src/gpcmap.cu src/gpcmap_rm.c include/gpcmap.h
+libgpcmap.so: src/gpcmap.cu src/gpcmap_rm.c include/gpcmap.h rmflags
 	$(NVCC) $(ARCHS) -O2 -std=c++17 -Iinclude -Xcompiler -fPIC -shared -o $@ src/gpcmap.cu src/gpcmap_rm.c $(RMFLAGS) -ldl -lcuda
+
+rmflags: FORCE
+	@echo '$(RMFLAGS)' | cmp -s - $@ || echo '$(RMFLAGS)' > $@
 
 gpcmap: src/gpcmap_cli.c libgpcmap.so include/gpcmap.h
 	$(CC) $(CFLAGS) -Iinclude -o $@ src/gpcmap_cli.c -L. -lgpcmap -Wl,-rpath,'$$ORIGIN'
 
 clean:
-	rm -f libgpcmap.so gpcmap
+	rm -f libgpcmap.so gpcmap rmflags
 
-.PHONY: all clean
+.PHONY: all clean FORCE
