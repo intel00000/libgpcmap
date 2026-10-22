@@ -132,7 +132,7 @@ static void complement(gpcmap_t *m, int timeout_ms)
                 continue;
             int r = child_fits(s, three, 3, timeout_ms);
             fprintf(stderr, "gpcmap: TPC %d with GPC %d (TPCs %d, %d, %d): %s\n", s, g, three[0], three[1], three[2],
-                    r == 1 ? "a cluster runs: same GPC" : r == 0 ? "pends: not this GPC"
+                    r == 1 ? "a cluster runs: same GPC" : r == 0 ? "pends: no cluster on these four TPCs"
                                                                  : "error");
             if (r == 1)
                 m->gpc_of_tpc[s] = g;
@@ -225,10 +225,21 @@ int main(int argc, char **argv)
     if (do_complement && !strcmp(map.method, "cluster"))
         complement(&map, timeout_ms);
     print_map(&map, stdout);
-    if (map.corun_conflicts)
+    int unplaced = 0;
+    for (int t = 0; t < map.num_tpcs; ++t)
+        unplaced += map.gpc_of_tpc[t] < 0;
+    if (unplaced)
     {
-        fprintf(stderr, "gpcmap: %d co-run merges refused for exceeding a GPC: the grouping is in doubt\n",
-                map.corun_conflicts);
+        fprintf(stderr, "gpcmap: %d TPCs unplaced: the map is incomplete\n", unplaced);
+        rc = 2;
+    }
+    if (!strcmp(map.method, "corun"))
+    {
+        fprintf(stderr, "gpcmap: the co-run method finds the groups of TPCs that share a path to memory; they are the "
+                        "GPCs where that path is the GPC's and sub-groups of a GPC where it is not (A100): "
+                        "GPC membership is not established by timing alone\n");
+        if (map.corun_conflicts)
+            fprintf(stderr, "gpcmap: %d co-run merges refused for exceeding a GPC\n", map.corun_conflicts);
         rc = 2;
     }
     if (validate)

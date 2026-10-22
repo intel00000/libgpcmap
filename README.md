@@ -25,28 +25,40 @@ the map; it has to be read from the device.
   than partition every SM: TPCs left unplaced are settled afterwards, one
   cluster on the TPC plus three TPCs of a candidate GPC, which runs only when
   they share the GPC. A cluster that finds no room pends for good, so the
-  command runs each of those tries in a child process with a timeout.
-- `corun`: because streaming kernels share a GPC's path to memory, this
-  method proceeds in two stages.
-  
+  command runs each of those tries in a child process with a timeout. A try
+  can also pend inside the table's GPC (seen on an H200 for the tail TPCs of
+  a GPC: cluster placement is constrained below the GPC), so TPCs may stay
+  unplaced; the command then exits 2 and the driver's table is the complete
+  answer.
+- `corun`: the groups of TPCs that share a path to memory, by timing, in
+  two stages.
+
   - First, each TPC streams against every other TPC. The victim's runtime
     with an aggressor is compared with its solo runtime. In each row, a
     plateau of nearly equal slowdowns identifies the closest peers, and
     mutually slowing TPCs are merged.
 
   - Next, pairs of clusters stream together, and their runtime is compared with
-    the sum of their separate rates.
-    Clusters in the same GPC share a path and therefore run slower together;
-    unrelated pairs show only the device-wide effect, measured using foreign
+    the sum of their separate rates, against the same union with foreign
     stand-ins of the partner's size.
+    Clusters on one path run slower together; unrelated pairs show only the
+    device-wide effect, which the stand-ins measure.
     A join requires at least 10% overhead over the additive time and 5% overhead
     over the stand-ins in both directions.
-
     Merges are selected by strength, subject to the ten-TPC limit, and repeated
-    until no more merges are possible. If a join exceed a GPC's capacity, the map
-    is considered uncertain; the command reports this and exits 2. This is a
-    timing-only method and serves as the fallback when clusters are unavailable
-    (Ampere) or the driver table is refused (MIG slices).
+    until no more merges are possible.
+
+  What the groups are depends on the part: on an RTX 5090 the path is the
+  GPC's (one streaming TPC slows its whole GPC by 14%, two halves of a GPC
+  stream together at 1.4 to 2.0 times their additive time) and the groups are
+  the eleven GPCs; on an A100 the path belongs to a sub-group of three or four
+  TPCs (pairs couple at 1.52, the sub-group at 1.14, the two halves of a GPC
+  not at all, and a same-GPC triple and quad stream together no slower than
+  foreign ones), so the groups are the sub-groups and the GPC does not show.
+  The command therefore reports a co-run map as shared-path groups, in doubt
+  as a GPC map, and exits 2 (a join refused for exceeding the limit is
+  reported as well); the JSON says `"groups": "shared_path"`. On Ampere the
+  GPC comes from the driver's table or not at all.
 
 Every answer is followed by the single-TPC check: with TPC t alone enabled a
 kernel lands on SMs 2t and 2t+1, both and no other.
@@ -65,7 +77,7 @@ prints the GPCs with their TPC ids and writes the JSON (`gpc_to_tpcs`) that
 the geometry suite and slackserve's mask layouts read. `--method` picks one
 method, `--no-complement` skips the per-TPC settlement, `--no-validate` the
 check; `GPCMAP_DUMP=<prefix>` writes the co-run matrices as CSV. Exit 0 is
-a checked answer, 2 an answer in doubt, 1 no answer. The C API (`gpcmap_init`, `gpcmap_query`,
+a checked GPC map, 2 a map in doubt (every co-run map, a refused join, or TPCs left unplaced), 1 no answer. The C API (`gpcmap_init`, `gpcmap_query`,
 `gpcmap_cluster_fits`, `gpcmap_validate`, `gpcmap_write_json`).
 
 ## Measured so far

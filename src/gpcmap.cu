@@ -362,12 +362,13 @@ int gpcmap_cluster_fits(int dev, const int *tpcs, int n, int timeout_ms)
 // tldr: TPCs that share a GPC slow each other down when they stream together;
 // TPCs in different GPCs have less of an impact on each other.
 //
-// Two stages. The atoms: every TPC streams against every other, the victim's
-// time beside the aggressor over its time alone (back to back, so clock drift
-// cancels); a row's plateau of near-equal slowdowns is its closest kin and
-// mutually slow TPCs merge. The joining: two clusters stream together, and
-// clusters in one GPC share its path to memory and stream slower than their
-// rates add up to.
+// The groups of TPCs that share a path to memory. The atoms: every TPC
+// streams against every other, the victim's time beside the aggressor over
+// its time alone (back to back, so clock drift cancels); a row's plateau of
+// near-equal slowdowns is its closest kin and mutually slow TPCs merge. The
+// joining: two clusters stream together and clusters on one path stream
+// slower than their rates add up to. The path is the GPC's on GB202; on
+// GA100 it is a sub-group's, and the GPC does not show at all.
 static float median_of(std::vector<float> v)
 {
     std::sort(v.begin(), v.end());
@@ -861,9 +862,10 @@ int gpcmap_write_json(const gpcmap_t *m, const char *path)
     if (!f)
         return errno;
     fprintf(f, "{\n \"device\": \"%s\",\n \"uuid\": \"%s\",\n \"cuda_device\": %d,\n \"sms\": %d,\n \"tpcs\": %d,\n"
-               " \"method\": \"%s\",\n \"cluster_capacity\": %d,\n \"corun_conflicts\": %d,\n \"gpc_to_tpcs\": {",
-            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method, m->cluster_capacity,
-            m->corun_conflicts);
+               " \"method\": \"%s\",\n \"groups\": \"%s\",\n \"cluster_capacity\": %d,\n \"corun_conflicts\": %d,\n"
+               " \"gpc_to_tpcs\": {",
+            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method,
+            strcmp(m->method, "corun") ? "gpc" : "shared_path", m->cluster_capacity, m->corun_conflicts);
     for (int g = 0; g < m->num_gpcs; ++g)
     {
         fprintf(f, "%s\n  \"%d\": [", g ? "," : "", g);

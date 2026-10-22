@@ -8,7 +8,8 @@
  *   cluster  thread-block clusters (Hopper and later): the CTAs of one
  *            cluster are co-resident in one GPC; TPCs the clusters leave
  *            unplaced are settled by gpcmap_cluster_fits()
- *   corun    streaming kernels slow each other more inside one GPC
+ *   corun    the groups of TPCs that share a path to memory (the GPCs on
+ *            GB202, sub-groups of a GPC on GA100): a map in doubt, exit 2
  * Every answer is checked by the single-TPC %smid test (gpcmap_validate). */
 #ifndef GPCMAP_H
 #define GPCMAP_H
