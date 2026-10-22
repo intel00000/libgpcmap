@@ -9,11 +9,11 @@ GPC for a clustered decode kernel—must read this map from the device.
 
 ## Methods
 
-- `rm`: reads the driver's own table through two non-privileged RM controls
-  (`NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER` and
-  `..._GET_SM_TO_GPC_TPC_MAPPINGS`). It is exact but unavailable on MIG
-  slices, and its ABI is tied to the installed driver; build it with
-  `make RM=1 NV=/path/to/open-gpu-kernel-modules` from that driver.
+- `rm`: reads the driver's exact TPC-to-GPC table through two unprivileged RM
+  controls (`NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER` and
+  `..._GET_SM_TO_GPC_TPC_MAPPINGS`). It is unavailable on MIG slices, and its
+  ABI depends on the installed driver. The method is built when that driver's
+  open-gpu-kernel-modules tree is found.
 
   The table identifies both the physical GPC for each TPC (its memory path)
   and the virtual GPC where the work distributor places clusters. Both are
@@ -70,48 +70,48 @@ GPC for a clustered decode kernel—must read this map from the device.
 
 | | `rm` | `nvdebug` | `cluster` | `corun` |
 | --- | --- | --- | --- | --- |
-| source | the driver's SM order table, two RM controls: the physical and the virtual GPC of every TPC | the same table in hardware, the work distributor's `CWD_GPC_TPC_ID` registers through the nvdebug module | where clusters of 8 CTAs land: co-resident in one GPC | timing: streams that share a path to memory slow each other |
-| nature | read, exact | read, exact | measured placement, exact where it covers | measured contention, inferred |
-| needs | the open-kernel-module SDK headers at build time (`RM=1`); no privilege | the module loaded as root; reading is unprivileged; a context active | Hopper or later; libsmctrl stream masks | libsmctrl stream masks; a quiet GPU |
-| refused or absent | on MIG slices | where the module cannot be loaded | Ampere and older | never; finds nothing on Hopper |
-| answer | the physical and the virtual GPC of every TPC | the GPC of every TPC | the virtual GPC of every TPC the clusters reach; the rest settled one by one; single-TPC virtual GPCs stay unplaced | the groups of TPCs that share a path: the GPCs on GB202, sub-groups of three or four inside a GPC on GA100 |
-| cost | milliseconds | milliseconds | 0.6 s on an RTX 5090, 109 s on an H200 | about 4 min on an RTX 5090, 2.5 min on an A100 |
-| exit, `groups` | 0, `gpc` | 0, `gpc` | 0, `virtual_gpc`; 2 with TPCs left unplaced | 2, `shared_path`; a refused join is counted |
-| hazards | ABI tied to the installed driver | PCI-order numbering; zero while the GPU is off | a cluster that finds no room pends for good, hence child processes | drift, size-dependent floors, one-way partner spikes, all handled; still inference |
+| source | Driver SM-order table | Hardware `CWD_GPC_TPC_ID` registers via `nvdebug` | Placement of 8-CTA clusters within a GPC | Timing VRAM contention |
+| nature | Exact | Exact | Measured placement; exact where covered | Inferred from measured contention |
+| needs | open-gpu-kernel-modules tree at build time; no privilege | Loaded module, root access to load it | Hopper or later and libsmctrl stream masks | libsmctrl stream masks |
+| refused or absent | MIG slices | If the module cannot be loaded | Ampere and before | - |
+| answer | Physical and virtual GPC for every TPC | GPC for every TPC | Virtual GPCs reachable by clusters; remaining TPCs are settled individually, except singleton virtual GPCs | TPC groups sharing a path |
+| cost | Milliseconds | Milliseconds | 0.6 s on an RTX 5090; 109 s on an H200 | 4 min on an RTX 5090; 2.5 min on an A100 |
+| exit, `groups` | 0, `gpc` | 0, `gpc` | 0, `virtual_gpc`; 2 if TPCs remain unplaced | 2, `shared_path`; refused joins are counted |
+| hazards | ABI depends on the installed driver | PCI-order numbering | - | Drift, size-dependent floors, and one-way spikes; still inferred |
 
-`rm` is the ground truth where it builds, `nvdebug` the same table where
-the module is loaded; `cluster` recovers the virtual GPCs, less the
-single-TPC ones, without privileges or headers on Hopper and later;
+`rm` is the ground truth, `nvdebug` the same table where the module can be loaded; `cluster` recovers the virtual GPCs, unless the device has
+single-TPC ones, limited to Hopper and later `corun` works on an Ampere MIG slice and finds the sub-group
+structure there.
 
-`corun` is what remains on an Ampere MIG slice and finds the sub-group
-structure there. `auto` tries them in order and takes the first
-answer; every answer is followed by the single-TPC check.
+Default tries these in order and takes the first
+answer.
 
-No probe runs under MPS: MPS emulates `%smid` per client (every client's
-blocks report SM ids from zero), so the command refuses the probing methods
-and the check when an MPS control daemon is reachable.
-
-Every answer is followed by the single-TPC check: with TPC t alone enabled a
-kernel lands on SMs 2t and 2t+1, both and no other.
+Every answer is followed by the single-TPC check: with TPC t alone enabled a kernel lands on SMs 2t and 2t+1.
 
 ## Layout
 
-`include/gpcmap.h` is the C API; `src/gpcmap.cu` the probes and the check,
-`src/gpcmap_rm.c` the driver-table method, `src/gpcmap_cli.c` the command.
+```text
+include/
+└── gpcmap.h              C API
+src/
+├── gpcmap.cu             probes and validation
+├── gpcmap_rm.c           driver-table method
+└── gpcmap_cli.c          command-line interface
+third_party/
+└── libsmctrl/            libsmctrl fork (submodule)
+cmake/                    driver kernel-module-tree search
+```
 
 ## Use
 
-    make
-    ./gpcmap --smctrl /path/to/libsmctrl.so --json gpc_map.json
+    git clone --recurse-submodules https://github.com/intel00000/libgpcmap.git
+    cmake -S . -B build && cmake --build build
+    ./build/gpcmap --json gpc_map.json
 
-prints the GPCs with their TPC ids and writes the JSON that the geometry
-suite and slackserve's mask layouts read: `gpc_to_tpcs` with `groups` saying
-what its groups are (`gpc`, `virtual_gpc`, `shared_path`), and
-`virtual_gpc_to_tpcs` when the method knows the virtual grouping. `--method` picks one
-method, `--no-complement` skips the per-TPC settlement, `--no-validate` the
-check; `GPCMAP_DUMP=<prefix>` writes the co-run matrices as CSV. Exit 0 is
-a checked GPC map, 2 a map in doubt (every co-run map, a refused join, or TPCs left unplaced), 1 no answer. The C API (`gpcmap_init`, `gpcmap_query`,
-`gpcmap_cluster_fits`, `gpcmap_validate`, `gpcmap_groups`, `gpcmap_write_json`).
+The build looks for the open-gpu-kernel-modules tree of the installed driver.
+libsmctrl is built from the submodule and linked into the command, so `--smctrl` is only needed to use another copy.
+
+After a driver update, configure again against the new tree.
 
 ## Measured so far
 

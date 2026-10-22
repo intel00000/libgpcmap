@@ -25,11 +25,47 @@
 static const char *g_smctrl = NULL;
 static int g_device = 0;
 
-static int usage(void)
+static int usage(FILE *f)
 {
-    fprintf(stderr, "usage: gpcmap [--device N] [--smctrl PATH] [--method auto|rm|nvdebug|cluster|corun] [--json FILE]\n"
-                    "              [--no-validate] [--no-complement] [--timeout-ms T]\n");
-    return 2;
+    fprintf(f, "usage: gpcmap [options]\n"
+               "\n"
+               "Prints the GPC map of a CUDA device: which TPC ids share a GPC, and outputs as JSON.\n"
+               "\n"
+               "options\n"
+               "  --device N         CUDA device (default 0)\n"
+               "  --smctrl PATH      libsmctrl shared object for the stream masks (default: the linked copy)\n"
+               "  --method M         auto | rm | nvdebug | cluster | corun; auto tries them in that order\n"
+               "                     and takes the first answer (default auto)\n"
+               "  --json FILE        write the map as JSON\n"
+               "  --no-complement    skip the settling of TPCs the clusters left unplaced\n"
+               "  --no-validate      skip the single-TPC check (TPC t alone enabled lands on SMs 2t, 2t+1)\n"
+               "  --timeout-ms T     how long a settling try waits for its cluster (default 3000)\n"
+               "  -h, --help         this page\n"
+               "\n"
+               "methods\n"
+               "  rm        the driver's table (physical GPC and virtual GPC of every TPC); needs the\n"
+               "            open-gpu-kernel-modules tree at build time; refused on MIG slices\n"
+               "  nvdebug   the work distributor's table through the nvdebug kernel module's /proc files\n"
+               "  cluster   where clusters of 8 CTAs land: the virtual GPCs (Hopper and later)\n"
+               "  corun     timing: the groups of TPCs that share a path to memory (a map in doubt)\n"
+               "\n"
+               "json\n"
+               "  device, uuid, cuda_device, sms, tpcs, method, cluster_capacity, corun_conflicts\n"
+               "  groups              what gpc_to_tpcs holds: gpc (physical), virtual_gpc, shared_path\n"
+               "  gpc_to_tpcs         {\"<group>\": [tpc, ...]}\n"
+               "  virtual_gpc_to_tpcs the virtual GPCs, when the method knows them\n"
+               "  unplaced            TPCs in no group\n"
+               "\n"
+               "environment\n"
+               "  GPCMAP_DUMP=PREFIX  write the co-run matrices as PREFIX.round<n>.csv / PREFIX.join<n>.csv\n"
+               "  GPCMAP_DEBUG=1      print every judged co-run pair\n"
+               "  GPCMAP_CORUN_SPLIT  halve every co-run cluster before the joining, as a check of it\n"
+               "\n"
+               "exit status\n"
+               "  0  a checked GPC map\n"
+               "  2  a map in doubt: every co-run map, a refused co-run join, or TPCs left unplaced\n"
+               "  1  no answer (methods unavailable)\n");
+    return f == stdout ? 0 : 1;
 }
 
 static int child_fits(int s, const int *g, int n_g, int timeout_ms)
@@ -223,8 +259,10 @@ int main(int argc, char **argv)
             validate = 0;
         else if (!strcmp(argv[i], "--no-complement"))
             do_complement = 0;
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
+            return usage(stdout);
         else
-            return usage();
+            return usage(stderr);
     }
     if (g_smctrl && !*g_smctrl)
         g_smctrl = NULL;

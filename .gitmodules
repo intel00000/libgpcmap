@@ -1,0 +1,3 @@
+[submodule "third_party/libsmctrl"]
+	path = third_party/libsmctrl
+	url = ../libsmctrl.git

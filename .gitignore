@@ -6,7 +6,7 @@
 *.fatbin
 
 # build outputs
+build/
 libgpcmap.so
 gpcmap
 *.o
-rmflags
