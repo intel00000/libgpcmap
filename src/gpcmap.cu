@@ -431,6 +431,40 @@ struct Corun
         return median_of(r);
     }
 
+    // the time to stream the buffer on these TPCs together, median of three
+    float stream_ms(const std::vector<int> &tpcs)
+    {
+        gpcmap_mask_stream(agg, tpcs.data(), (int)tpcs.size());
+        std::vector<float> ts;
+        for (int i = 0; i <= 3; ++i)
+        {
+            cudaEventRecord(e0, agg);
+            k_stream_read<<<32 * (int)tpcs.size(), 256, 0, agg>>>((const float4 *)buf_a, n4, sink, 2);
+            cudaEventRecord(e1, agg);
+            cudaStreamSynchronize(agg);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (i)
+                ts.push_back(ms);
+        }
+        return median_of(ts);
+    }
+
+    // how much slower two clusters stream together than their rates add up
+    // to: above 1 when they share a path to memory
+    float cap(const std::vector<int> &a, const std::vector<int> &b)
+    {
+        std::vector<int> both(a);
+        both.insert(both.end(), b.begin(), b.end());
+        std::vector<float> r;
+        for (int i = 0; i < 3; ++i)
+        {
+            float ta = stream_ms(a), tb = stream_ms(b), tab = stream_ms(both);
+            r.push_back(tab * (1.0f / ta + 1.0f / tb));
+        }
+        return median_of(r);
+    }
+
     void release()
     {
         gpcmap_mask_stream(agg, nullptr, 0);
@@ -570,6 +604,131 @@ static int method_corun(int dev, gpcmap_t *out)
                     fprintf(f, "%d", cl[a][0]);
                     for (size_t b = 0; b < k; ++b)
                         fprintf(f, ",%.4f", ratio[a][b]);
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
+        if (!merges)
+            break;
+        std::vector<std::vector<int>> next;
+        std::vector<int> index(k, -1);
+        for (size_t a = 0; a < k; ++a)
+        {
+            int r = uf.find((int)a);
+            if (index[r] < 0)
+            {
+                index[r] = (int)next.size();
+                next.push_back({});
+            }
+            next[index[r]].insert(next[index[r]].end(), cl[a].begin(), cl[a].end());
+        }
+        for (auto &g : next)
+            std::sort(g.begin(), g.end());
+        cl = next;
+    }
+    if (getenv("GPCMAP_CORUN_SPLIT"))
+    { // a check of the joining stage: halve every cluster first
+        std::vector<std::vector<int>> halves;
+        for (auto &g : cl)
+        {
+            if (g.size() < 2)
+            {
+                halves.push_back(g);
+                continue;
+            }
+            halves.push_back(std::vector<int>(g.begin(), g.begin() + g.size() / 2));
+            halves.push_back(std::vector<int>(g.begin() + g.size() / 2, g.end()));
+        }
+        cl = halves;
+    }
+    // Joining: clusters on the same GPC share a memory path, so they run
+    // together more slowly than the sum of their individual rates. Pairs on
+    // different GPCs with the same sizes are limited by device-wide capacity;
+    // a row's excess over same-sized clusters identifies its GPC-mates.
+    for (int pass = 0; pass < 8; ++pass)
+    {
+        const size_t k = cl.size();
+        std::vector<std::vector<float>> capv(k, std::vector<float>(k, 0.0f));
+        int measured = 0;
+        for (size_t a = 0; a < k; ++a)
+            for (size_t b = a + 1; b < k; ++b)
+                if ((int)(cl[a].size() + cl[b].size()) <= MAX_GPC_TPCS)
+                {
+                    capv[a][b] = capv[b][a] = c.cap(cl[a], cl[b]);
+                    measured++;
+                }
+        if (!measured)
+            break;
+        std::vector<std::vector<float>> excess(k, std::vector<float>(k, 0.0f));
+        for (size_t a = 0; a < k; ++a)
+        {
+            std::vector<float> all;
+            for (size_t b = 0; b < k; ++b)
+                if (capv[a][b] > 0)
+                    all.push_back(capv[a][b]);
+            if (all.empty())
+                continue;
+            float row_median = median_of(all);
+            for (size_t b = 0; b < k; ++b)
+            {
+                if (capv[a][b] <= 0)
+                    continue;
+                std::vector<float> same;
+                for (size_t o = 0; o < k; ++o)
+                    if (capv[a][o] > 0 && cl[o].size() == cl[b].size())
+                        same.push_back(capv[a][o]);
+                float base = same.size() >= 3   ? median_of(same)
+                             : same.size() == 2 ? std::min(same[0], same[1])
+                                                : row_median;
+                excess[a][b] = capv[a][b] - base;
+            }
+        }
+        struct Link
+        {
+            float strength;
+            int a, b;
+        };
+        std::vector<Link> links;
+        for (size_t a = 0; a < k; ++a)
+            for (size_t b = a + 1; b < k; ++b)
+                if (capv[a][b] >= 1.05f && excess[a][b] >= 0.05f && excess[b][a] >= 0.05f)
+                    links.push_back({std::min(excess[a][b], excess[b][a]), (int)a, (int)b});
+        std::sort(links.begin(), links.end(), [](const Link &x, const Link &y)
+                  { return x.strength > y.strength; });
+        UnionFind uf((int)k);
+        std::vector<int> size(k);
+        for (size_t a = 0; a < k; ++a)
+            size[a] = (int)cl[a].size();
+        int merges = 0, refused = 0;
+        for (const Link &l : links)
+        {
+            int ra = uf.find(l.a), rb = uf.find(l.b);
+            if (ra == rb)
+                continue;
+            if (size[ra] + size[rb] > MAX_GPC_TPCS)
+            {
+                refused++;
+                continue;
+            }
+            uf.unite(ra, rb);
+            size[uf.find(ra)] = size[ra] + size[rb];
+            merges++;
+        }
+        out->corun_conflicts += refused;
+        fprintf(stderr, "gpcmap: corun join %d: %zu clusters, %d pairs streamed together, %d merges, %d refused\n",
+                pass + 1, k, measured, merges, refused);
+        if (const char *dump = getenv("GPCMAP_DUMP"))
+        {
+            char path[512];
+            snprintf(path, sizeof(path), "%s.join%d.csv", dump, pass + 1);
+            if (FILE *f = fopen(path, "w"))
+            {
+                for (size_t a = 0; a < k; ++a)
+                {
+                    fprintf(f, "%d", cl[a][0]);
+                    for (size_t b = 0; b < k; ++b)
+                        fprintf(f, ",%.4f", capv[a][b]);
                     fprintf(f, "\n");
                 }
                 fclose(f);
