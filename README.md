@@ -26,14 +26,19 @@ the map; it has to be read from the device.
   cluster on the TPC plus three TPCs of a candidate GPC, which runs only when
   they share the GPC. A cluster that finds no room pends for good, so the
   command runs each of those tries in a child process with a timeout.
-- `corun`: a streaming kernel on an anchor TPC slows a one-TPC victim more
-  inside its own GPC (the per-GPC path to memory). The anchor starts as one
-  TPC, since consecutive ids rarely share a GPC, and grows by the slowest
-  victim while the slowdowns show no clear split; a group is accepted when
-  they split into two modes (gap of 3% or more), the last group when every
-  TPC left is slowed alike. Timing only, so the fallback where clusters do
-  not exist (Ampere) or the table is refused (MIG); on the RTX 5090 it gives
-  the same map as the cluster method in 90 s (slow mode 12 to 13% behind).
+- `corun`: streaming kernels contend for the GPC's path to memory, so a
+  victim slows more beside an aggressor in its own GPC. The method is
+  agglomerative: clusters start as single TPCs; each round every cluster
+  streams as the aggressor against every other cluster as the victim, a row's
+  slowdowns split into a slow mode (gap of 3% or more) and the rest, mutually
+  slow clusters merge (a row with no split defers to a bigger aggressor's
+  row), and the merged clusters press harder in the next round; a merge
+  beyond ten TPCs ends the method with no answer. Timing only, so the
+  fallback where clusters do not exist (Ampere) or the table is refused (MIG
+  slices). On the RTX 5090 one streaming TPC already slows its whole GPC
+  (12 to 13%) and the first round yields the map; on an A100 one TPC couples
+  to one partner only and the pairs find the rest of their GPC in later
+  rounds.
 
 Every answer is followed by the single-TPC check: with TPC t alone enabled a
 kernel lands on SMs 2t and 2t+1, both and no other.

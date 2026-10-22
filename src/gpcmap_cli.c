@@ -31,7 +31,7 @@ static int usage(void)
 
 static int child_fits(int s, const int *g, int n_g, int timeout_ms)
 {
-    /* 1 fits, 0 pends, -1 error: the launch in a child of our own binary */
+    /* 1 fits, 0 pends, -1 error */
     pid_t pid = fork();
     if (pid < 0)
         return -1;
@@ -73,7 +73,7 @@ static int child_fits(int s, const int *g, int n_g, int timeout_ms)
 
 static int stride_of(const gpcmap_t *m, int g)
 {
-    /* the most common difference between consecutive member ids */
+    /* the common difference between consecutive member ids */
     int counts[GPCMAP_MAX_TPCS] = {0}, prev = -1, best = 1, best_n = 0;
     for (int t = 0; t < m->num_tpcs; ++t)
         if (m->gpc_of_tpc[t] == g)
@@ -97,7 +97,7 @@ static void complement(gpcmap_t *m, int timeout_ms)
     {
         if (m->gpc_of_tpc[s] >= 0)
             continue;
-        /* candidates: the GPCs, best id-pattern fit first */
+        /* candidate GPCs, best id-pattern fit first */
         int order[GPCMAP_MAX_GPCS], score[GPCMAP_MAX_GPCS];
         for (int g = 0; g < m->num_gpcs; ++g)
         {
@@ -205,7 +205,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if (fits)
-    { /* the child: exit 0 when the cluster ran, 3 when it is still pending */
+    { /* the child: 0 ran, 3 pending */
         int tpcs[4], n = 0;
         char *copy = strdup(fits);
         for (char *tok = strtok(copy, ","); tok && n < 4; tok = strtok(NULL, ","))

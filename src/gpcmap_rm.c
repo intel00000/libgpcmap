@@ -129,7 +129,7 @@ int gpcmap_rm_query(const char *uuid, gpcmap_t *out)
         return ENODEV;
     char dev[32];
     snprintf(dev, sizeof(dev), "/dev/nvidia%d", minor);
-    int gpu_fd = open(dev, O_RDWR | O_CLOEXEC); /* kept open: osIsGpuAccessible() */
+    int gpu_fd = open(dev, O_RDWR | O_CLOEXEC); /* must stay open for the controls */
     if (gpu_fd < 0)
         return errno;
     int ctl_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
@@ -172,7 +172,7 @@ int gpcmap_rm_query(const char *uuid, gpcmap_t *out)
     memset(&order, 0, sizeof(order));
     if (rm_control(ctl_fd, client, subdevice, NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER, &order, sizeof(order)))
     {
-        rc = EACCES; /* refused: a MIG slice, or a driver without the control */
+        rc = EACCES; /* refused: a MIG slice */
         goto done;
     }
     if ((int)order.numSm != out->num_sms)
@@ -180,7 +180,7 @@ int gpcmap_rm_query(const char *uuid, gpcmap_t *out)
         rc = ERANGE;
         goto done;
     }
-    /* the table is per SM; TPC t is SMs 2t and 2t+1 and both must agree */
+    /* per SM; both SMs of a TPC must agree */
     int gpc_ids[GPCMAP_MAX_GPCS * 4];
     int n_ids = 0;
     for (unsigned i = 0; i < order.numSm; ++i)

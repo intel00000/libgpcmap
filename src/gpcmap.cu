@@ -30,7 +30,7 @@ int gpcmap_init(const char *smctrl_path)
 
 void gpcmap_mask_stream(void *stream, const int *tpcs, int n)
 {
-    // libsmctrl: a set bit DISABLES the TPC; 128 bits; zero means unrestricted.
+    // libsmctrl: a set bit disables the TPC; zero means unrestricted
     uint64_t lo = 0, hi = 0;
     if (n > 0)
     {
@@ -66,9 +66,7 @@ __global__ void k_smid(int *out, long long spin_cycles)
     }
 }
 
-// The CTAs of one cluster are resident together in one GPC: each records its
-// SM after the cluster has assembled. Dynamic shared memory sized by the
-// caller so that one CTA fills an SM.
+// each CTA of a cluster records its SM; the dynamic shared memory leaves one CTA per SM
 __global__ void k_cluster(int *sm_of_block, long long spin_cycles)
 {
     extern __shared__ unsigned char big[];
@@ -222,7 +220,7 @@ struct UnionFind
 
 static void groups_to_map(UnionFind &uf, gpcmap_t *out)
 {
-    // components of more than one TPC become GPCs, numbered by their lowest TPC id
+    // components of two or more TPCs are GPCs, numbered by their lowest TPC
     std::vector<int> root_of_tpc(out->num_tpcs);
     for (int t = 0; t < out->num_tpcs; ++t)
         root_of_tpc[t] = uf.find(2 * t);
@@ -299,8 +297,7 @@ static int method_cluster(int dev, gpcmap_t *out)
     int rc = 0;
     for (int i = 0; i < 10 && !rc; ++i)
         rc = run(cap);
-    // one TPC excluded at a time: clusters move around it (always feasible,
-    // every GPC keeps the rest of its TPCs)
+    // one TPC excluded at a time
     std::vector<int> all(out->num_tpcs);
     for (int t = 0; t < out->num_tpcs; ++t)
         all[t] = t;
@@ -318,16 +315,8 @@ static int method_cluster(int dev, gpcmap_t *out)
     cudaStreamDestroy(s);
     if (rc)
         return rc;
-    // SMs 2t and 2t+1 are one TPC: a component that splits a TPC is no GPC
     for (int t = 0; t < out->num_tpcs; ++t)
-    {
-        int a = uf.find(2 * t), b = uf.find(2 * t + 1);
-        if (a != b)
-        {
-            // one of them was never seen in a cluster: join it to its sibling
-            uf.unite(2 * t, 2 * t + 1);
-        }
-    }
+        uf.unite(2 * t, 2 * t + 1); // the two SMs of a TPC
     groups_to_map(uf, out);
     snprintf(out->method, sizeof(out->method), "cluster");
     return 0;
@@ -370,143 +359,268 @@ int gpcmap_cluster_fits(int dev, const int *tpcs, int n, int timeout_ms)
 }
 
 // the co-run method, see README.md
-// tldr: We assume that TPCs that share a GPC will slow each other down when they run together,
-// and that TPCs that do not share a GPC will has less of a impact.
+// tldr: TPCs that share a GPC slow each other down when they stream together;
+// TPCs in different GPCs have less of an impact on each other.
 //
-// Start with one TPC, then add the slowest TPC to the anchor until a gap appears in the slowdowns.
-// The slow TPCs are assigned to the same GPC as the anchor.
+// Agglomerative: clusters start as single TPCs; each round every cluster
+// streams against every other, the victim's time beside the aggressor over
+// its time alone, measured back to back so that clock drift cancels; a row's
+// GPC-mates are its plateau of near-equal slowdowns; mutually slow clusters
+// merge and press harder in the next round.
 static float median_of(std::vector<float> v)
 {
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
 }
 
+static const int MAX_GPC_TPCS = 10;
+
+struct Corun
+{
+    cudaStream_t agg = nullptr, vic = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    float *buf_a = nullptr, *buf_v = nullptr, *sink = nullptr;
+    size_t n4 = 0;
+
+    int init()
+    {
+        const size_t bytes = (size_t)1 << 29;
+        if (cudaMalloc(&buf_a, bytes) != cudaSuccess || cudaMalloc(&buf_v, bytes) != cudaSuccess)
+            return EIO;
+        if (cudaMalloc(&sink, 8) != cudaSuccess)
+            return EIO;
+        cudaMemset(buf_a, 0, bytes);
+        cudaMemset(buf_v, 0, bytes);
+        cudaStreamCreate(&agg);
+        cudaStreamCreate(&vic);
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        n4 = bytes / 16;
+        return 0;
+    }
+
+    float run(const std::vector<int> &victim, const std::vector<int> *aggressor)
+    {
+        if (aggressor)
+            k_stream_read<<<32 * (int)aggressor->size(), 256, 0, agg>>>((const float4 *)buf_a, n4, sink,
+                                                                        2 * (int)aggressor->size());
+        cudaEventRecord(e0, vic);
+        k_stream_read<<<16 * (int)victim.size(), 256, 0, vic>>>((const float4 *)buf_v, n4, sink, 1);
+        cudaEventRecord(e1, vic);
+        cudaStreamSynchronize(vic);
+        cudaStreamSynchronize(agg);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        return ms;
+    }
+
+    // the victim's slowdown beside the aggressor: alone and together, three
+    // times each, back to back
+    float ratio(const std::vector<int> &victim, const std::vector<int> &aggressor)
+    {
+        gpcmap_mask_stream(vic, victim.data(), (int)victim.size());
+        gpcmap_mask_stream(agg, aggressor.data(), (int)aggressor.size());
+        run(victim, nullptr);
+        std::vector<float> r;
+        for (int i = 0; i < 3; ++i)
+        {
+            float solo = run(victim, nullptr);
+            float co = run(victim, &aggressor);
+            r.push_back(co / solo);
+        }
+        return median_of(r);
+    }
+
+    void release()
+    {
+        gpcmap_mask_stream(agg, nullptr, 0);
+        gpcmap_mask_stream(vic, nullptr, 0);
+        cudaFree(buf_a);
+        cudaFree(buf_v);
+        cudaFree(sink);
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaStreamDestroy(agg);
+        cudaStreamDestroy(vic);
+    }
+};
+
 static int method_corun(int dev, gpcmap_t *out)
 {
-    const size_t bytes = (size_t)1 << 30;
-    float *buf_a = nullptr, *buf_v = nullptr, *sink = nullptr;
-    if (cudaMalloc(&buf_a, bytes) != cudaSuccess)
+    Corun c;
+    if (c.init())
         return EIO;
-    if (cudaMalloc(&buf_v, bytes) != cudaSuccess)
-        return EIO;
-    if (cudaMalloc(&sink, 8) != cudaSuccess)
-        return EIO;
-    cudaMemset(buf_a, 0, bytes);
-    cudaMemset(buf_v, 0, bytes);
-    cudaStream_t agg, vic;
-    cudaStreamCreate(&agg);
-    cudaStreamCreate(&vic);
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    const size_t n4 = bytes / 16;
-    auto victim_ms = [&](bool with_aggressor, int agg_blocks) -> float
-    {
-        std::vector<float> ts;
-        for (int i = 0; i < 6; ++i)
-        {
-            if (with_aggressor)
-                k_stream_read<<<agg_blocks, 256, 0, agg>>>((const float4 *)buf_a, n4, sink, 4);
-            cudaEventRecord(e0, vic);
-            k_stream_read<<<16, 256, 0, vic>>>((const float4 *)buf_v, n4, sink, 1);
-            cudaEventRecord(e1, vic);
-            cudaStreamSynchronize(vic);
-            cudaStreamSynchronize(agg);
-            float ms = 0;
-            cudaEventElapsedTime(&ms, e0, e1);
-            if (i)
-                ts.push_back(ms); // the first run warms
-        }
-        return median_of(ts);
-    };
-    std::vector<int> unassigned;
+    std::vector<std::vector<int>> cl(out->num_tpcs);
     for (int t = 0; t < out->num_tpcs; ++t)
-        unassigned.push_back(t);
-    out->num_gpcs = 0;
-    int rc = 0;
-    // The anchor starts as one TPC (consecutive ids rarely share a GPC) and
-    // grows by the slowest victim while the slowdowns show no clear split.
-    while (!unassigned.empty() && !rc)
+        cl[t] = {t};
+    for (int round = 0; round < 8; ++round)
     {
-        std::vector<int> anchor = {unassigned[0]};
-        std::vector<int> high;
-        for (int attempt = 0;; ++attempt)
-        {
-            gpcmap_mask_stream(agg, anchor.data(), (int)anchor.size());
-            std::vector<std::pair<int, float>> slow; // (tpc, co / solo)
-            for (int t : unassigned)
-            {
-                if (std::find(anchor.begin(), anchor.end(), t) != anchor.end())
-                    continue;
-                gpcmap_mask_stream(vic, &t, 1);
-                float solo = victim_ms(false, 0);
-                float co = victim_ms(true, 32 * (int)anchor.size());
-                slow.push_back({t, co / solo});
-            }
-            if (slow.empty())
-                break;
-            std::vector<float> xs;
-            for (auto &p : slow)
-                xs.push_back(p.second);
-            std::sort(xs.begin(), xs.end());
-            float gap = 0, cut = xs.back();
-            for (size_t i = 0; i + 1 < xs.size(); ++i)
-                if (xs[i + 1] - xs[i] > gap)
-                {
-                    gap = xs[i + 1] - xs[i];
-                    cut = xs[i];
-                }
-            high.clear();
-            if (gap >= 0.03f)
-                for (auto &p : slow)
-                    if (p.second > cut)
-                        high.push_back(p.first);
-            fprintf(stderr, "gpcmap: corun anchor of %zu from TPC %d: best gap %.3f, %zu TPCs in the slow mode\n",
-                    anchor.size(), anchor[0], gap, high.size());
-            if (gap >= 0.03f && !high.empty() && high.size() <= 12)
-                break;
-            // the last GPC: every TPC left is a mate of the anchor, all slowed alike
-            if (gap < 0.03f && out->num_gpcs > 0 && slow.size() + anchor.size() <= 12 && xs[xs.size() / 2] >= 1.03f)
-            {
-                for (auto &p : slow)
-                    high.push_back(p.first);
-                break;
-            }
-            if (attempt == 3)
-            {
-                rc = EAGAIN;
-                break;
-            }
-            auto slowest = std::max_element(slow.begin(), slow.end(),
-                                            [](const std::pair<int, float> &a, const std::pair<int, float> &b)
-                                            {
-                                                return a.second < b.second;
-                                            });
-            anchor.push_back(slowest->first);
-        }
-        if (rc)
+        const size_t k = cl.size();
+        if (k < 2)
             break;
-        for (int u : anchor)
-            out->gpc_of_tpc[u] = out->num_gpcs;
-        for (int u : high)
-            out->gpc_of_tpc[u] = out->num_gpcs;
-        out->num_gpcs++;
-        std::vector<int> rest;
-        for (int u : unassigned)
-            if (out->gpc_of_tpc[u] < 0)
-                rest.push_back(u);
-        unassigned = rest;
+        std::vector<std::vector<float>> ratio(k, std::vector<float>(k, 1.0f));
+        for (size_t a = 0; a < k; ++a)
+            for (size_t b = 0; b < k; ++b)
+                if (a != b)
+                    ratio[a][b] = c.ratio(cl[b], cl[a]);
+        int remaining = 0;
+        for (auto &g : cl)
+            remaining += (int)g.size();
+        // a row's slow mode: the largest plateau (within 3%) of at least two
+        // clusters slowed 3% or more over the row's quiet half, no wider than
+        // a GPC; or all slowed alike when the rest fits one GPC; a row with
+        // neither is blank, keeping its strongest victim as a pair candidate
+        std::vector<std::vector<char>> slow(k, std::vector<char>(k, 0));
+        std::vector<char> blank(k, 1);
+        std::vector<int> lone(k, -1);
+        int split_rows = 0;
+        for (size_t a = 0; a < k; ++a)
+        {
+            std::vector<std::pair<float, int>> xs;
+            for (size_t b = 0; b < k; ++b)
+                if (b != a)
+                    xs.push_back({ratio[a][b], (int)b});
+            std::sort(xs.begin(), xs.end());
+            float base = xs[(xs.size() / 2) / 2].first;
+            std::vector<std::pair<float, int>> cand;
+            for (auto &x : xs)
+                if (x.first >= base + 0.03f)
+                    cand.push_back(x);
+            size_t best_i = 0, best_n = 0;
+            for (size_t i = 0; i < cand.size(); ++i)
+            {
+                size_t j = i;
+                while (j + 1 < cand.size() && cand[j + 1].first - cand[i].first <= 0.03f)
+                    j++;
+                if (j - i + 1 > best_n)
+                {
+                    best_n = j - i + 1;
+                    best_i = i;
+                }
+            }
+            if (best_n >= 2 && (int)best_n <= MAX_GPC_TPCS - (int)cl[a].size())
+            {
+                for (size_t i = best_i; i < best_i + best_n; ++i)
+                    slow[a][cand[i].second] = 1;
+                blank[a] = 0;
+                split_rows++;
+            }
+            else if (xs.front().first >= 1.03f && remaining <= MAX_GPC_TPCS)
+            {
+                for (size_t b = 0; b < k; ++b)
+                    slow[a][b] = b != a;
+                blank[a] = 0;
+            }
+            else if (xs.back().first >= base + 0.2f)
+            {
+                lone[a] = xs.back().second;
+            }
+        }
+        // merges by strength: plateaus naming each other, a plateau naming a
+        // blank smaller cluster, or two blank rows whose strongest victims are
+        // each other; none beyond a GPC
+        struct Link
+        {
+            float strength;
+            int a, b;
+        };
+        std::vector<Link> links;
+        for (size_t a = 0; a < k; ++a)
+            for (size_t b = a + 1; b < k; ++b)
+            {
+                bool mutual = slow[a][b] && slow[b][a];
+                bool defer = (slow[a][b] && blank[b] && cl[a].size() > cl[b].size()) ||
+                             (slow[b][a] && blank[a] && cl[b].size() > cl[a].size());
+                bool pair = lone[a] == (int)b && lone[b] == (int)a;
+                if (mutual || defer || pair)
+                    links.push_back({std::min(ratio[a][b], ratio[b][a]), (int)a, (int)b});
+            }
+        std::sort(links.begin(), links.end(), [](const Link &x, const Link &y)
+                  { return x.strength > y.strength; });
+        UnionFind uf((int)k);
+        std::vector<int> size(k);
+        for (size_t a = 0; a < k; ++a)
+            size[a] = (int)cl[a].size();
+        int merges = 0, refused = 0;
+        for (const Link &l : links)
+        {
+            int ra = uf.find(l.a), rb = uf.find(l.b);
+            if (ra == rb)
+                continue;
+            if (size[ra] + size[rb] > MAX_GPC_TPCS)
+            {
+                refused++;
+                continue;
+            }
+            uf.unite(ra, rb);
+            size[uf.find(ra)] = size[ra] + size[rb];
+            merges++;
+        }
+        out->corun_conflicts += refused;
+        fprintf(stderr, "gpcmap: corun round %d: %zu clusters, %d rows with a plateau, %d merges, %d refused\n",
+                round + 1, k, split_rows, merges, refused);
+        if (const char *dump = getenv("GPCMAP_DUMP"))
+        {
+            char path[512];
+            snprintf(path, sizeof(path), "%s.round%d.csv", dump, round + 1);
+            if (FILE *f = fopen(path, "w"))
+            {
+                for (size_t a = 0; a < k; ++a)
+                {
+                    fprintf(f, "%d", cl[a][0]);
+                    for (size_t b = 0; b < k; ++b)
+                        fprintf(f, ",%.4f", ratio[a][b]);
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
+        if (!merges)
+            break;
+        std::vector<std::vector<int>> next;
+        std::vector<int> index(k, -1);
+        for (size_t a = 0; a < k; ++a)
+        {
+            int r = uf.find((int)a);
+            if (index[r] < 0)
+            {
+                index[r] = (int)next.size();
+                next.push_back({});
+            }
+            next[index[r]].insert(next[index[r]].end(), cl[a].begin(), cl[a].end());
+        }
+        for (auto &g : next)
+            std::sort(g.begin(), g.end());
+        cl = next;
     }
-    gpcmap_mask_stream(agg, nullptr, 0);
-    gpcmap_mask_stream(vic, nullptr, 0);
-    cudaFree(buf_a);
-    cudaFree(buf_v);
-    cudaFree(sink);
-    cudaStreamDestroy(agg);
-    cudaStreamDestroy(vic);
-    if (!rc)
-        snprintf(out->method, sizeof(out->method), "corun");
-    return rc;
+    c.release();
+    std::sort(cl.begin(), cl.end(), [](const std::vector<int> &x, const std::vector<int> &y)
+              { return x[0] < y[0]; });
+    if (out->corun_conflicts)
+    {
+        fprintf(stderr, "gpcmap: corun: %d merges would have exceeded a GPC; the grouping is in doubt:\n",
+                out->corun_conflicts);
+        for (auto &g : cl)
+        {
+            fprintf(stderr, "   ");
+            for (int t : g)
+                fprintf(stderr, " %d", t);
+            fprintf(stderr, "\n");
+        }
+        return EAGAIN;
+    }
+    // clusters of two or more TPCs are the GPCs; the rest stay unplaced
+    out->num_gpcs = 0;
+    for (auto &g : cl)
+    {
+        if (g.size() < 2)
+            continue;
+        for (int t : g)
+            out->gpc_of_tpc[t] = out->num_gpcs;
+        out->num_gpcs++;
+    }
+    snprintf(out->method, sizeof(out->method), "corun");
+    return 0;
 }
 
 // validation
@@ -591,8 +705,9 @@ int gpcmap_write_json(const gpcmap_t *m, const char *path)
     if (!f)
         return errno;
     fprintf(f, "{\n \"device\": \"%s\",\n \"uuid\": \"%s\",\n \"cuda_device\": %d,\n \"num_sms\": %d,\n \"num_tpcs\": %d,\n"
-               " \"method\": \"%s\",\n \"cluster_capacity\": %d,\n \"gpc_to_tpcs\": {",
-            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method, m->cluster_capacity);
+               " \"method\": \"%s\",\n \"cluster_capacity\": %d,\n \"corun_conflicts\": %d,\n \"gpc_to_tpcs\": {",
+            m->name, m->uuid, m->cuda_device, m->num_sms, m->num_tpcs, m->method, m->cluster_capacity,
+            m->corun_conflicts);
     for (int g = 0; g < m->num_gpcs; ++g)
     {
         fprintf(f, "%s\n  \"%d\": [", g ? "," : "", g);
