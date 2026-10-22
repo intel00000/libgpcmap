@@ -66,6 +66,27 @@ the map; it has to be read from the device.
   reported as well); the JSON says `"groups": "shared_path"`. On Ampere the
   GPC comes from the driver's table or not at all.
 
+## Methods comparison
+
+| | `rm` | `nvdebug` | `cluster` | `corun` |
+| --- | --- | --- | --- | --- |
+| source | the driver's SM order table, two RM controls | the same table in hardware, the work distributor's `CWD_GPC_TPC_ID` registers through the nvdebug module | where clusters of 8 CTAs land: co-resident in one GPC | timing: streams that share a path to memory slow each other |
+| nature | read, exact | read, exact | measured placement, exact where it covers | measured contention, inferred |
+| needs | the open-kernel-module SDK headers at build time (`RM=1`); no privilege | the module loaded as root; reading is unprivileged; a context active | Hopper or later; libsmctrl stream masks | libsmctrl stream masks; a quiet GPU |
+| refused or absent | on MIG slices | where the module cannot be loaded | Ampere and older | never; finds nothing on Hopper |
+| answer | the GPC of every TPC | the GPC of every TPC | the GPC of every TPC the clusters reach; the rest settled one by one, or left unplaced | the groups of TPCs that share a path: the GPCs on GB202, sub-groups of three or four inside a GPC on GA100 |
+| cost | milliseconds | milliseconds | 0.6 s on an RTX 5090, 109 s on an H200 | about 4 min on an RTX 5090, 2.5 min on an A100 |
+| exit, `groups` | 0, `gpc` | 0, `gpc` | 0, `gpc`; 2 with TPCs left unplaced | 2, `shared_path`; a refused join is counted |
+| hazards | ABI tied to the installed driver | PCI-order numbering; zero while the GPU is off | a cluster that finds no room pends for good, hence child processes | drift, size-dependent floors, one-way partner spikes, all handled; still inference |
+
+`rm` and `nvdebug` are the ground truth where available and identical in
+content; `cluster` recovers the same map, less the tail TPCs its clusters
+never reach, without privileges or headers on Hopper and later;
+
+`corun` is what remains on an Ampere MIG slice and finds the sub-group
+structure there. `auto` tries them in order and takes the first
+answer; every answer is followed by the single-TPC check.
+
 No probe runs under MPS: MPS emulates `%smid` per client (every client's
 blocks report SM ids from zero), so the command refuses the probing methods
 and the check when an MPS control daemon is reachable.
@@ -94,9 +115,16 @@ a checked GPC map, 2 a map in doubt (every co-run map, a refused join, or TPCs l
 
 | part | SMs | GPCs enabled (TPCs each) | ids |
 | --- | --- | --- | --- |
-| A100 SXM4 80GB | 108 | 7: 7, 7, 8, 8, 8, 8, 8 | round robin, the 7-TPC GPCs last |
+| A100 SXM4 80GB | 108 | 7: 7, 7, 8, 8, 8, 8, 8 | round robin, the 7-TPC GPCs last; a second A100 identical; `corun` gives the two halves of every GPC |
 | H100 SXM 80GB | 132 | 8: 9, 8, 8, 8, 8, 8, 8, 9 | round robin for ids 0-31, seven GPCs for 32-59, leftovers 60-65 |
+| H200 SXM 141GB, three chips | 132 | 8: 6, 8, 8, 8, 9, 9, 9, 9 / 7, 8, 8, 8, 8, 9, 9, 9 / 8, 8, 8, 8, 8, 8, 9, 9 | as the H100 for ids 0-59; 60-65 differ per chip, so the map is per device |
 | RTX 5090 | 170 | 11 of 12: three of 7, eight of 8 | round robin for ids 0-76, 77-84 to the full GPCs |
+
+On one H200 the cluster method left the four tail TPCs of a GPC unplaced:
+a cluster of 8 pends on them with three TPCs of their own GPC, so cluster
+placement is constrained below the GPC and the table is the complete
+answer there. The co-run finds nothing on Hopper: two TPCs of one GPC
+stream as fast together as apart, the GPC's path binds only from four.
 
 ## Sources
 
