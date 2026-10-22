@@ -1,6 +1,6 @@
 /* gpcmap: print and save the GPC map of a device.
  *
- *   gpcmap [--device N] [--smctrl PATH] [--method auto|rm|cluster|corun]
+ *   gpcmap [--device N] [--smctrl PATH] [--method auto|rm|nvdebug|cluster|corun]
  *          [--json FILE] [--no-validate] [--no-complement] [--timeout-ms T]
  *
  * After the cluster method, each TPC the clusters left unplaced is tried
@@ -24,7 +24,7 @@ static int g_device = 0;
 
 static int usage(void)
 {
-    fprintf(stderr, "usage: gpcmap [--device N] [--smctrl PATH] [--method auto|rm|cluster|corun] [--json FILE]\n"
+    fprintf(stderr, "usage: gpcmap [--device N] [--smctrl PATH] [--method auto|rm|nvdebug|cluster|corun] [--json FILE]\n"
                     "              [--no-validate] [--no-complement] [--timeout-ms T]\n");
     return 2;
 }
@@ -219,7 +219,8 @@ int main(int argc, char **argv)
     if (rc)
     {
         gpcmap_describe(g_device, &map);
-        fprintf(stderr, "gpcmap: %s on %s: %s\n", method, map.name, strerror(rc));
+        fprintf(stderr, "gpcmap: %s on %s: %s%s\n", method, map.name, strerror(rc),
+                rc == EBUSY ? " (MPS is running: %smid is emulated per client, the probes cannot run)" : "");
         return 1;
     }
     if (do_complement && !strcmp(map.method, "cluster"))
@@ -248,7 +249,7 @@ int main(int argc, char **argv)
         int bad = gpcmap_validate(g_device, failed, 16);
         if (bad < 0)
         {
-            fprintf(stderr, "gpcmap: the single-TPC check could not run\n");
+            fprintf(stderr, "gpcmap: the single-TPC check could not run%s\n", bad == -EBUSY ? " under MPS" : "");
             return 1;
         }
         printf("single-TPC check: %d of %d TPCs map to exactly their two SMs%s\n", map.num_tpcs - bad, map.num_tpcs,

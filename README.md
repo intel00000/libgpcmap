@@ -17,6 +17,12 @@ the map; it has to be read from the device.
   (`NV2080_CTRL_CMD_GR_GET_GLOBAL_SM_ORDER`, `..._GET_SM_TO_GPC_TPC_MAPPINGS`).
   Exact, refused on MIG slices, and ABI-bound: build with
   `make RM=1 NV=/path/to/open-gpu-kernel-modules` of the installed driver.
+- `nvdebug`: the same table from the hardware, when `nvdebug` kernel module
+  is loaded: `/proc/gpuN/CWD_GPC_TPC_ID*` are the work distributor's registers
+  the driver programs with its striping of logical
+  TPC ids over the GPCs, one byte per TPC with the GPC in the upper nibble.
+  Loading the module needs root, reading the files does not; the table reads as
+  zero while the GPU is off.
 - `cluster`: thread-block clusters (Hopper and later). The 8 CTAs of one
   cluster are resident in one GPC, so the SMs they land on share a GPC;
   clusters are launched with one TPC excluded at a time and the SMs unioned.
@@ -60,6 +66,10 @@ the map; it has to be read from the device.
   reported as well); the JSON says `"groups": "shared_path"`. On Ampere the
   GPC comes from the driver's table or not at all.
 
+No probe runs under MPS: MPS emulates `%smid` per client (every client's
+blocks report SM ids from zero), so the command refuses the probing methods
+and the check when an MPS control daemon is reachable.
+
 Every answer is followed by the single-TPC check: with TPC t alone enabled a
 kernel lands on SMs 2t and 2t+1, both and no other.
 
@@ -87,3 +97,15 @@ a checked GPC map, 2 a map in doubt (every co-run map, a refused join, or TPCs l
 | A100 SXM4 80GB | 108 | 7: 7, 7, 8, 8, 8, 8, 8 | round robin, the 7-TPC GPCs last |
 | H100 SXM 80GB | 132 | 8: 9, 8, 8, 8, 8, 8, 8, 9 | round robin for ids 0-31, seven GPCs for 32-59, leftovers 60-65 |
 | RTX 5090 | 170 | 11 of 12: three of 7, eight of 8 | round robin for ids 0-76, 77-84 to the full GPCs |
+
+## Sources
+
+- Stream masks: the libsmctrl fork at `github.com/intel00000/libsmctrl`,
+  from libsmctrl (`rtsrv.cs.unc.edu/public/libsmctrl.git`; J. Bakita and
+  J. H. Anderson, "Hardware Compute Partitioning on NVIDIA GPUs", RTAS 2023).
+- The `nvdebug` method follows `libsmctrl_get_gpc_info_ext()` from libsmctrl
+  `ecrts25-ae` branch and reads the files of Bakita's nvdebug kernel module.
+  The MPS check follows `libsmctrl_is_mps_running()`.
+  (J. Bakita and J. H. Anderson, "Hardware Compute Partitioning on NVIDIA GPUs
+  for Composable Systems", ECRTS 2025 (DOI 10.4230/LIPIcs.ECRTS.2025.21),
+  "Demystifying NVIDIA GPU Internals to Enable Reliable GPU Management", RTAS 2024)

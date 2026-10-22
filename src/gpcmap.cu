@@ -11,7 +11,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <dirent.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #include <algorithm>
+#include <string>
 #include <vector>
 
 namespace cg = cooperative_groups;
@@ -110,6 +115,25 @@ __global__ void k_stream_read(const float4 *__restrict__ p, size_t n4, float *si
     }
     if (acc == 123456.789f)
         sink[0] = acc;
+}
+
+// Under MPS every client sees emulated %smid values, so no probe can run.
+// After libsmctrl_is_mps_running() (Bakita, libsmctrl branch ecrts25-ae).
+int gpcmap_mps_running(void)
+{
+    const char *dir = getenv("CUDA_MPS_PIPE_DIRECTORY");
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/control", dir ? dir : "/tmp/nvidia-mps");
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0)
+        return 0;
+    const int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &yes, sizeof(yes));
+    int up = connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(fd);
+    return up;
 }
 
 // helpers
@@ -783,6 +807,8 @@ static int method_corun(int dev, gpcmap_t *out)
 int gpcmap_validate(int dev, int *failed, int max_failed)
 {
     gpcmap_t info;
+    if (gpcmap_mps_running())
+        return -EBUSY;
     if (describe(dev, &info) < 0)
         return -1;
     if (cudaSetDevice(dev) != cudaSuccess)
@@ -824,6 +850,113 @@ int gpcmap_validate(int dev, int *failed, int max_failed)
     return bad;
 }
 
+// nvdebug
+static int read_proc_u64(const char *path, uint64_t *out)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return errno;
+    char buf[64] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (!n)
+        return EIO;
+    *out = strtoull(buf, nullptr, 0);
+    return 0;
+}
+
+// nvdebug numbers GPUs in PCI order: the CUDA device's place among the
+// driver's GPUs sorted by bus id
+static int nvdebug_index(int dev)
+{
+    char bus[32];
+    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), dev) != cudaSuccess)
+        return -1;
+    for (char *c = bus; *c; ++c)
+        *c = tolower(*c);
+    std::vector<std::string> ids;
+    if (DIR *d = opendir("/proc/driver/nvidia/gpus"))
+    {
+        while (struct dirent *e = readdir(d))
+            if (e->d_name[0] != '.')
+                ids.push_back(e->d_name);
+        closedir(d);
+    }
+    std::sort(ids.begin(), ids.end());
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        std::string id = ids[i];
+        for (auto &c : id)
+            c = tolower(c);
+        if (id == bus)
+            return (int)i;
+    }
+    return ids.size() == 1 ? 0 : -1;
+}
+
+// The work distributor's GPC/TPC id table (NV_PGRAPH_PRI_CWD_GPC_TPC_ID), the
+// driver's striping of logical TPC ids over the GPCs, one byte per TPC with
+// the GPC in the upper nibble; readable only while a context is active.
+int gpcmap_nvdebug_query(int dev, gpcmap_t *out)
+{
+    int n = nvdebug_index(dev);
+    if (n < 0)
+        return ENODEV;
+    char path[128];
+    uint64_t max_gpcs, gpc_mask, per_gpc;
+    snprintf(path, sizeof(path), "/proc/gpu%d/num_gpcs", n);
+    int rc = read_proc_u64(path, &max_gpcs);
+    if (rc)
+        return rc;
+    snprintf(path, sizeof(path), "/proc/gpu%d/gpc_mask", n);
+    if ((rc = read_proc_u64(path, &gpc_mask)))
+        return rc;
+    snprintf(path, sizeof(path), "/proc/gpu%d/num_tpc_per_gpc", n);
+    if ((rc = read_proc_u64(path, &per_gpc)))
+        return rc;
+    int enabled = 0;
+    for (unsigned g = 0; g < max_gpcs; ++g)
+    {
+        if ((gpc_mask >> g) & 1)
+            continue;
+        uint64_t off;
+        snprintf(path, sizeof(path), "/proc/gpu%d/gpc%u_tpc_mask", n, g);
+        if ((rc = read_proc_u64(path, &off)))
+            return rc;
+        off &= (per_gpc >= 64) ? ~0ull : ((1ull << per_gpc) - 1);
+        enabled += (int)per_gpc - __builtin_popcountll(off);
+    }
+    if (enabled != out->num_tpcs)
+        return ERANGE;
+    int physical[GPCMAP_MAX_GPCS * 2];
+    int n_ids = 0;
+    uint64_t total = 0;
+    for (int t = 0; t < enabled; t += 4)
+    {
+        uint64_t reg;
+        snprintf(path, sizeof(path), "/proc/gpu%d/CWD_GPC_TPC_ID%d", n, t / 4);
+        if ((rc = read_proc_u64(path, &reg)))
+            return rc;
+        total += reg;
+        for (int j = 0; j < 4 && t + j < enabled; ++j)
+        {
+            int gpc = (int)((reg >> (j * 8 + 4)) & 0xf);
+            int k;
+            for (k = 0; k < n_ids && physical[k] != gpc; ++k)
+            {
+            }
+            if (k == n_ids)
+                physical[n_ids++] = gpc;
+            out->gpc_of_tpc[t + j] = k;
+        }
+    }
+    if (!total)
+        return EIO; // the table reads as zero while the GPU is off
+    out->num_gpcs = n_ids;
+    snprintf(out->method, sizeof(out->method), "nvdebug");
+    return 0;
+}
+
 // the query
 int gpcmap_query(int dev, const char *method, gpcmap_t *out)
 {
@@ -841,6 +974,18 @@ int gpcmap_query(int dev, const char *method, gpcmap_t *out)
         if (rc == 0 || !automatic)
             return rc;
         describe(dev, out);
+    }
+    if (automatic || !strcmp(method, "nvdebug"))
+    {
+        rc = gpcmap_nvdebug_query(dev, out);
+        if (rc == 0 || !automatic)
+            return rc;
+        describe(dev, out);
+    }
+    if (!strcmp(method, "cluster") || !strcmp(method, "corun") || automatic)
+    {
+        if (gpcmap_mps_running())
+            return EBUSY;
     }
     if (automatic || !strcmp(method, "cluster"))
     {

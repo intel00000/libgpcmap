@@ -5,6 +5,8 @@
  * the device:
  *   rm       the driver's table through two RM controls (build with RM=1
  *            against the open-gpu-kernel-modules SDK; refused on MIG)
+ *   nvdebug  the same table from the work distributor's registers through
+ *            the nvdebug kernel module's /proc/gpuN files, when loaded
  *   cluster  thread-block clusters (Hopper and later): the CTAs of one
  *            cluster are co-resident in one GPC; TPCs the clusters leave
  *            unplaced are settled by gpcmap_cluster_fits()
@@ -44,8 +46,10 @@ extern "C"
     /* Confine a cudaStream_t to these TPCs; n == 0 clears the mask. */
     void gpcmap_mask_stream(void *stream, const int *tpcs, int n);
 
-    /* The map by "rm", "cluster", "corun" or "auto" (that order). 0, or ENOSYS
-     * (not built or not supported here), EAGAIN (no clear answer), EIO. */
+    /* The map by "rm", "nvdebug", "cluster", "corun" or "auto" (that order). 0,
+     * or ENOSYS (not built or not supported here), ENOENT (nvdebug not loaded),
+     * EBUSY (MPS is running: %smid is emulated per client, no probe can run),
+     * EAGAIN (no clear answer), EIO. */
     int gpcmap_query(int cuda_device, const char *method, gpcmap_t *out);
 
     /* Does one cluster of 8 CTAs run with only these TPCs enabled? 1 ran,
@@ -64,6 +68,14 @@ extern "C"
     int gpcmap_write_json(const gpcmap_t *map, const char *path);
 
     /* gpcmap_rm.c; ENOSYS unless built with RM=1. */
+    int gpcmap_rm_query(const char *uuid, gpcmap_t *out);
+
+    /* nvdebug's /proc/gpuN files (the module numbers GPUs in PCI order). */
+    int gpcmap_nvdebug_query(int cuda_device, gpcmap_t *out);
+
+    /* Is an MPS control daemon reachable (the way nvidia-cuda-mps-control checks)? */
+    int gpcmap_mps_running(void);
+
     int gpcmap_rm_query(const char *uuid, gpcmap_t *out);
 
 #ifdef __cplusplus
