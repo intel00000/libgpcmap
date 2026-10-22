@@ -4,3 +4,8 @@
 *.ptx
 *.cubin
 *.fatbin
+
+# build outputs
+libgpcmap.so
+gpcmap
+*.o
